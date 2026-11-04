@@ -21,24 +21,32 @@ header {visibility: hidden;}
     color: #2C221E;
 }
 
-h1, h2, h3 {
+h1, h2, h3, h4 {
     font-family: 'Cormorant Garamond', Georgia, serif !important;
     color: #2C221E !important;
-    font-weight: 600 !important;
+    font-weight: 700 !important;
     letter-spacing: -0.01em;
+    margin-top: 0.6rem !important;
 }
 
 p, li, div {
     font-family: 'Inter', sans-serif;
-    color: #4A3F35;
-    line-height: 1.65;
+    color: #3D3228;
+    line-height: 1.68;
+    font-size: 0.97rem;
+}
+
+/* Make bold text inside insights stand out cleanly */
+strong {
+    color: #231A14;
+    font-weight: 600;
 }
 
 .vintage-card {
     background: linear-gradient(135deg, #FBF6E9 0%, #F5DEC0 55%, #F2CFAA 100%);
     border-radius: 22px;
     padding: 30px 26px;
-    margin: 22px 0 16px 0;
+    margin: 22px 0 14px 0;
     border: 1px solid #E6D2B5;
     box-shadow: 0 8px 24px rgba(139, 98, 59, 0.08);
 }
@@ -49,7 +57,7 @@ p, li, div {
     letter-spacing: 0.16em;
     text-transform: uppercase;
     color: #8C735B;
-    margin-bottom: 18px;
+    margin-bottom: 16px;
     font-weight: 600;
 }
 
@@ -68,7 +76,7 @@ p, li, div {
     vertical-align: super;
     font-family: 'Inter', sans-serif;
     font-weight: 600;
-    margin-right: 3px;
+    margin-right: 4px;
 }
 
 .vintage-ref {
@@ -77,16 +85,16 @@ p, li, div {
     letter-spacing: 0.12em;
     text-transform: uppercase;
     color: #8C735B;
-    font-weight: 500;
+    font-weight: 600;
 }
 
 .insight-card {
     background-color: #FFFDF9;
     border-radius: 18px;
-    padding: 22px 24px;
-    margin-bottom: 28px;
+    padding: 26px 26px;
+    margin-bottom: 30px;
     border: 1px solid #EFE6D8;
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.02);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.03);
 }
 
 .stButton > button {
@@ -100,12 +108,6 @@ p, li, div {
     font-weight: 600 !important;
     letter-spacing: 0.03em !important;
     box-shadow: 0 4px 12px rgba(110, 75, 42, 0.2) !important;
-    transition: all 0.2s ease !important;
-}
-
-.stButton > button:hover {
-    opacity: 0.94 !important;
-    transform: translateY(-1px);
 }
 
 .stButton > button p {
@@ -146,24 +148,31 @@ def load_bible():
 
 bible_data = load_bible()
 
-# Pull API Key (strips any accidental whitespace)
 raw_key = st.secrets.get("shanesapi", None)
 api_key = raw_key.strip() if raw_key else None
 
-# Auto-detect available Llama models from Groq
+# Prioritize the smartest 70B+ models first!
 @st.cache_data
 def get_available_models(_key):
     try:
         client = Groq(api_key=_key)
         models = client.models.list()
-        # Filter out audio/whisper/guard models and prioritize Llama models
-        chat_models = [
+        available_ids = [
             m.id for m in models.data 
-            if not any(x in m.id.lower() for x in ["whisper", "guard", "tts", "vision", "embed"])
+            if not any(x in m.id.lower() for x in ["whisper", "guard", "tts", "vision", "embed", "audio"])
         ]
-        llama_models = [m for m in chat_models if "llama" in m.lower()]
-        other_models = [m for m in chat_models if "llama" not in m.lower()]
-        return sorted(llama_models, reverse=True) + sorted(other_models)
+        # Preferred smart models in order of quality
+        preferred_order = [
+            "llama-3.3-70b-versatile",
+            "meta-llama/llama-4-maverick-17b-128e-instruct",
+            "meta-llama/llama-4-scout-17b-16e-instruct",
+            "llama-3.1-70b-versatile",
+            "qwen-qwq-32b",
+            "llama-3.1-8b-instant"
+        ]
+        ordered = [m for m in preferred_order if m in available_ids]
+        remaining = [m for m in available_ids if m not in ordered]
+        return ordered + remaining
     except Exception:
         return ["meta-llama/llama-4-scout-17b-16e-instruct", "llama-3.1-8b-instant"]
 
@@ -185,13 +194,14 @@ with st.expander("📖 Select Book & Chapter", expanded=False):
     
     if api_key:
         available_models = get_available_models(api_key)
-        selected_model = st.selectbox("AI Model", available_models, index=0)
+        selected_model = st.selectbox("AI Teacher Model", available_models, index=0)
     else:
         selected_model = "llama-3.1-8b-instant"
     
     if st.button("Begin / Reset Chapter", use_container_width=True):
         st.session_state.current_chunk = 0
         st.session_state.history = []
+        st.session_state.chapter_summary = None
         st.session_state.prayer_generated = False
         st.rerun()
 
@@ -199,6 +209,8 @@ if "current_chunk" not in st.session_state:
     st.session_state.current_chunk = 0
 if "history" not in st.session_state:
     st.session_state.history = []
+if "chapter_summary" not in st.session_state:
+    st.session_state.chapter_summary = None
 if "prayer_generated" not in st.session_state:
     st.session_state.prayer_generated = False
 
@@ -206,25 +218,74 @@ verses = selected_book['chapters'][selected_chapter_num - 1]
 chunks = [verses[i:i + chunk_size] for i in range(0, len(verses), chunk_size)]
 total_chunks = len(chunks)
 
-# --- LLAMA (GROQ) HELPER FUNCTIONS ---
+# --- STRICT DEVOTIONAL PROMPTS ---
+SYSTEM_PROMPT = """You are an insightful, warm, and clear Bible study teacher writing a clean devotional guide.
+CRITICAL RULES:
+1. NEVER include conversational filler like "Sure, let's break down...", "Here is the analysis", or "In this request". Start IMMEDIATELY with the first heading.
+2. Quote or reference the NASB (New American Standard Bible) wording when discussing the text.
+3. Keep explanations minimalistic, grounded in historical/cultural context, and deeply practical. Do not hallucinate events from other chapters."""
+
 def get_llama_insight(book, chapter, verse_range, text, previous_context, model_id):
     client = Groq(api_key=api_key)
     prompt = f"""
-    We are doing a step-by-step Bible study of {book} Chapter {chapter}.
-    We are currently reading verses {verse_range}:
-    "{text}"
-    
-    Previous sections covered so far: {previous_context if previous_context else "Beginning of the chapter."}
-    
-    Please provide:
-    1. If this isn't the first section, 1 brief sentence tying this to what we just read.
-    2. Explain the meaning of these verses in 3-4 short, warm, insightful bullet points (mentioning NASB phrasing/nuance where helpful).
-    3. End with a bold 1-sentence 'Takeaway'.
-    """
+Passage: {book} {chapter}:{verse_range}
+Text: "{text}"
+Previous context in this chapter: {previous_context if previous_context else "This is the opening section of the chapter."}
+
+Write a clean, theme-driven devotional breakdown of ONLY {book} {chapter}:{verse_range} using this EXACT Markdown template:
+
+### The Big Picture: [Create a Short, Compelling Theme Title]
+[2-3 clear sentences setting the scene. If this is not the first section, smoothly connect it to what happened right before this. Explain the main tension or big idea of these verses.]
+
+### [1. Short Sub-Theme Title (Verses X–Y)]
+* **The Context:** [1-2 sentences explaining who is involved or important cultural/historical background.]
+* **What Happens:** [1-2 sentences explaining the action or dialogue, quoting key NASB phrases.]
+* **The Meaning:** [2-3 sentences unpacking the deeper spiritual truth and why Jesus/the author says or does this.]
+
+### [2. Second Short Sub-Theme Title (Verses Y–Z)]
+* **The Context:** [1-2 sentences of background or setup.]
+* **What Happens:** [1-2 sentences on the action/response.]
+* **The Meaning:** [2-3 sentences unpacking the heart of the lesson.]
+
+### Summary
+* **[Key Contrast or Point 1]:** [1 punchy sentence]
+* **[Key Contrast or Point 2]:** [1 punchy sentence]
+
+**Ultimately:** [1 final, memorable sentence summarizing what {book} {chapter}:{verse_range} teaches us about following God.]
+"""
     completion = client.chat.completions.create(
         model=model_id,
+        temperature=0.4,
         messages=[
-            {"role": "system", "content": "You are a warm, clear, and insightful Bible study teacher."},
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
+        ]
+    )
+    return completion.choices[0].message.content
+
+def get_chapter_summary(book, chapter, full_chapter_text, model_id):
+    client = Groq(api_key=api_key)
+    prompt = f"""
+We just finished reading all of {book} Chapter {chapter}.
+Full chapter text: "{full_chapter_text}"
+
+Provide a clean, minimalistic "Big Picture Chapter Summary" using this EXACT Markdown structure (no intro chatter):
+
+### The Big Picture of {book} {chapter}
+[2-3 sentences explaining the overarching message and flow of the entire chapter from start to finish.]
+
+### Major Themes We Saw
+* **1. [Theme 1]:** [1-2 clear sentences tying back to specific moments in the chapter.]
+* **2. [Theme 2]:** [1-2 clear sentences.]
+* **3. [Theme 3]:** [1-2 clear sentences.]
+
+**The Ultimate Takeaway:** [1 powerful closing sentence that captures the heart of {book} {chapter}.]
+"""
+    completion = client.chat.completions.create(
+        model=model_id,
+        temperature=0.4,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
         ]
     )
@@ -233,21 +294,35 @@ def get_llama_insight(book, chapter, verse_range, text, previous_context, model_
 def get_prayer_and_application(book, chapter, full_chapter_text, model_id):
     client = Groq(api_key=api_key)
     prompt = f"""
-    We just finished studying {book} Chapter {chapter}. 
-    Full text: "{full_chapter_text}"
-    
-    How can I pray over this chapter and integrate it and apply it into my life?
-    Break your response down into 3 main themes from the chapter. For each theme provide:
-    - **The Heart Check** (A question to ask myself)
-    - **How to Apply It** (A practical action for this week)
-    - **How to Pray** (A short written prayer)
-    
-    End with a **Simple 1-Minute Morning Prayer** that ties the whole chapter together.
-    """
+Passage: {book} Chapter {chapter}
+Full text: "{full_chapter_text}"
+
+Write a personal, practical guide on how to pray over this chapter and integrate it into daily life. Use this EXACT Markdown template (no intro chatter):
+
+### 1. [Practical Theme 1 Title]
+* **The Heart Check:** [1-2 piercing, honest questions to ask myself based on this chapter.]
+* **How to Apply It:** [1 specific, concrete action I can take this week.]
+* **How to Pray:** > *"[A sincere, 2-3 sentence first-person prayer]"*
+
+### 2. [Practical Theme 2 Title]
+* **The Heart Check:** [1-2 honest questions to ask myself.]
+* **How to Apply It:** [1 specific, concrete action for this week.]
+* **How to Pray:** > *"[A sincere, 2-3 sentence first-person prayer]"*
+
+### 3. [Practical Theme 3 Title]
+* **The Heart Check:** [1-2 honest questions to ask myself.]
+* **How to Apply It:** [1 specific, concrete action for this week.]
+* **How to Pray:** > *"[A sincere, 2-3 sentence first-person prayer]"*
+
+---
+### A Simple 1-Minute Prayer to Start Your Day
+> **"[A unified, powerful 4-sentence daily prayer weaving all three themes of {book} {chapter} together. Amen.]"**
+"""
     completion = client.chat.completions.create(
         model=model_id,
+        temperature=0.4,
         messages=[
-            {"role": "system", "content": "You are a wise, practical Christian pastor helping someone apply Scripture to their daily life."},
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
         ]
     )
@@ -272,7 +347,7 @@ for item in st.session_state.history:
     
     st.markdown(f"""
     <div class="insight-card">
-        <div class="vintage-label" style="margin-bottom: 10px;">STUDY NOTES & INSIGHTS</div>
+        <div class="vintage-label" style="margin-bottom: 6px;">STUDY NOTES & INSIGHTS</div>
     """, unsafe_allow_html=True)
     st.markdown(item['insight'])
     st.markdown("</div>", unsafe_allow_html=True)
@@ -289,25 +364,44 @@ if st.session_state.current_chunk < total_chunks:
     html_text = " ".join([f"<span class='vintage-verse-num'>{start_v + i}</span>{v}" for i, v in enumerate(current_verses)])
     
     if st.button(f"Read Verses {v_range}  →", use_container_width=True):
-        with st.spinner("Reflecting on the passage..."):
-            prev_summary = " | ".join([f"v.{h['range']}" for h in st.session_state.history])
+        with st.spinner("Unpacking the themes of this passage..."):
+            prev_summary = " | ".join([f"Verses {h['range']}: {h['plain_text']}" for h in st.session_state.history[-2:]])
             insight = get_llama_insight(selected_book_name, selected_chapter_num, v_range, plain_text, prev_summary, selected_model)
             
             st.session_state.history.append({
                 "range": v_range,
+                "plain_text": plain_text,
                 "html_text": html_text,
                 "insight": insight
             })
             st.session_state.current_chunk += 1
             st.rerun()
 
-# --- END OF CHAPTER: PRAYER & APPLICATION ---
+# --- END OF CHAPTER: BIG PICTURE SUMMARY + PRAYER & APPLICATION ---
 else:
-    st.markdown("<div style='text-align: center; margin: 20px 0; font-family: Cormorant Garamond, serif; font-size: 1.3rem; color: #6E4B2A;'>— Chapter Complete —</div>", unsafe_allow_html=True)
+    st.markdown("<div style='text-align: center; margin: 24px 0 12px 0; font-family: Cormorant Garamond, serif; font-size: 1.4rem; color: #6E4B2A;'>— Chapter Complete —</div>", unsafe_allow_html=True)
+    
+    # Automatically generate Big Picture Chapter Summary when chapter finishes
+    if not st.session_state.chapter_summary:
+        with st.spinner("Synthesizing the Big Picture of the chapter..."):
+            full_text = " ".join(verses)
+            st.session_state.chapter_summary = get_chapter_summary(selected_book_name, selected_chapter_num, full_text, selected_model)
+            st.rerun()
+            
+    if st.session_state.chapter_summary:
+        st.markdown("""
+        <div class="vintage-card">
+            <div class="vintage-label">CHAPTER OVERVIEW</div>
+            <h2 style="margin-top: 0; margin-bottom: 4px;">The Big Picture Summary</h2>
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown('<div class="insight-card">', unsafe_allow_html=True)
+        st.markdown(st.session_state.chapter_summary)
+        st.markdown('</div>', unsafe_allow_html=True)
     
     if not st.session_state.prayer_generated:
-        if st.button("🙏 Prayer & Life Application", use_container_width=True):
-            with st.spinner("Preparing your prayer & application guide..."):
+        if st.button("🙏 How can I pray over & apply this chapter?", use_container_width=True):
+            with st.spinner("Preparing your personal prayer & application guide..."):
                 full_text = " ".join(verses)
                 prayer_guide = get_prayer_and_application(selected_book_name, selected_chapter_num, full_text, selected_model)
                 st.session_state.prayer_guide = prayer_guide
@@ -317,8 +411,8 @@ else:
     if st.session_state.prayer_generated:
         st.markdown("""
         <div class="vintage-card">
-            <div class="vintage-label">DEVOTIONAL & PRAYER</div>
-            <h2 style="margin-top: 0; margin-bottom: 10px;">Integrating the Word</h2>
+            <div class="vintage-label">DEVOTIONAL & APPLICATION</div>
+            <h2 style="margin-top: 0; margin-bottom: 4px;">Integrating the Word</h2>
         </div>
         """, unsafe_allow_html=True)
         
