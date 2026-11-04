@@ -150,31 +150,6 @@ bible_data = load_bible()
 raw_key = st.secrets.get("shanesapi", None)
 api_key = raw_key.strip() if raw_key else None
 
-# ONLY allow genuine Llama chat models (ignores Orpheus, Whisper, Guard, etc.)
-@st.cache_data
-def get_llama_models(_key):
-    try:
-        client = Groq(api_key=_key)
-        models = client.models.list()
-        llama_ids = [
-            m.id for m in models.data 
-            if "llama" in m.id.lower() and not any(x in m.id.lower() for x in ["guard", "vision", "audio", "tts", "whisper", "prompt"])
-        ]
-        # Prioritize larger/newer Llama models first
-        preferred = [
-            "meta-llama/llama-4-maverick-17b-128e-instruct",
-            "meta-llama/llama-4-scout-17b-16e-instruct",
-            "llama-3.3-70b-versatile",
-            "llama-3.1-70b-versatile",
-            "llama-3.1-8b-instant"
-        ]
-        ordered = [m for m in preferred if m in llama_ids]
-        remaining = [m for m in llama_ids if m not in ordered]
-        result = ordered + remaining
-        return result if result else preferred
-    except Exception:
-        return ["meta-llama/llama-4-scout-17b-16e-instruct", "llama-3.1-8b-instant"]
-
 # --- PASSAGE SELECTOR ---
 with st.expander("📖 Select Book & Chapter", expanded=False):
     if not api_key:
@@ -191,13 +166,6 @@ with st.expander("📖 Select Book & Chapter", expanded=False):
     
     chunk_size = st.slider("Verses per reading card", min_value=3, max_value=10, value=5)
     
-    if api_key:
-        available_models = get_llama_models(api_key)
-        selected_model = st.selectbox("Llama Model", available_models, index=0)
-    else:
-        available_models = ["llama-3.1-8b-instant"]
-        selected_model = "llama-3.1-8b-instant"
-    
     if st.button("Begin / Reset Chapter", use_container_width=True):
         st.session_state.current_chunk = 0
         st.session_state.history = []
@@ -213,6 +181,8 @@ if "chapter_summary" not in st.session_state:
     st.session_state.chapter_summary = None
 if "prayer_generated" not in st.session_state:
     st.session_state.prayer_generated = False
+if "working_model" not in st.session_state:
+    st.session_state.working_model = None
 
 verses = selected_book['chapters'][selected_chapter_num - 1]
 chunks = [verses[i:i + chunk_size] for i in range(0, len(verses), chunk_size)]
@@ -225,28 +195,52 @@ CRITICAL RULES:
 2. Quote or reference the NASB (New American Standard Bible) wording when discussing the text.
 3. Keep explanations minimalistic, grounded in historical/cultural context, and deeply practical. Do not hallucinate events from other chapters."""
 
-# Helper that automatically falls back to another Llama model if one fails
-def call_groq_safely(prompt, primary_model, all_models):
+# Automatically cycles through every model on your Groq account until one succeeds!
+def call_groq_safely(prompt):
     client = Groq(api_key=api_key)
-    models_to_try = [primary_model] + [m for m in all_models if m != primary_model]
-    last_err = None
-    for m in models_to_try:
+    
+    # 1. Fetch all real model IDs currently active on your Groq account
+    try:
+        live_models = [m.id for m in client.models.list().data]
+    except Exception:
+        live_models = []
+        
+    # Sort so Llama and chat models are tried first, and audio/guard models last
+    llama_first = [m for m in live_models if "llama" in m.lower() and "guard" not in m.lower()]
+    other_chat = [m for m in live_models if m not in llama_first and not any(x in m.lower() for x in ["whisper", "orpheus", "tts", "guard", "embed", "playai"])]
+    everything_else = [m for m in live_models if m not in llama_first and m not in other_chat]
+    
+    candidate_models = llama_first + other_chat + everything_else
+    
+    # If we already found a working model earlier in this session, try it first!
+    if st.session_state.working_model:
+        candidate_models = [st.session_state.working_model] + [m for m in candidate_models if m != st.session_state.working_model]
+        
+    errors = []
+    for model_id in candidate_models:
         try:
             completion = client.chat.completions.create(
-                model=m,
+                model=model_id,
                 temperature=0.4,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": prompt}
                 ]
             )
-            return completion.choices[0].message.content
+            content = completion.choices[0].message.content
+            # If the model uses <think> tags (like Qwen/DeepSeek), strip them out cleanly
+            if "<think>" in content and "</think>" in content:
+                content = content.split("</think>")[-1].strip()
+            st.session_state.working_model = model_id
+            return content
         except Exception as e:
-            last_err = e
+            errors.append(f"{model_id}: {str(e)}")
             continue
-    raise last_err
+            
+    st.error("None of the models on your Groq account responded. Models tried: " + " | ".join(errors))
+    st.stop()
 
-def get_llama_insight(book, chapter, verse_range, text, previous_context, model_id, all_models):
+def get_llama_insight(book, chapter, verse_range, text, previous_context):
     prompt = f"""
 Passage: {book} {chapter}:{verse_range}
 Text: "{text}"
@@ -273,9 +267,9 @@ Write a clean, theme-driven devotional breakdown of ONLY {book} {chapter}:{verse
 
 **Ultimately:** [1 final, memorable sentence summarizing what {book} {chapter}:{verse_range} teaches us about following God.]
 """
-    return call_groq_safely(prompt, model_id, all_models)
+    return call_groq_safely(prompt)
 
-def get_chapter_summary(book, chapter, full_chapter_text, model_id, all_models):
+def get_chapter_summary(book, chapter, full_chapter_text):
     prompt = f"""
 We just finished reading all of {book} Chapter {chapter}.
 Full chapter text: "{full_chapter_text}"
@@ -292,9 +286,9 @@ Provide a clean, minimalistic "Big Picture Chapter Summary" using this EXACT Mar
 
 **The Ultimate Takeaway:** [1 powerful closing sentence that captures the heart of {book} {chapter}.]
 """
-    return call_groq_safely(prompt, model_id, all_models)
+    return call_groq_safely(prompt)
 
-def get_prayer_and_application(book, chapter, full_chapter_text, model_id, all_models):
+def get_prayer_and_application(book, chapter, full_chapter_text):
     prompt = f"""
 Passage: {book} Chapter {chapter}
 Full text: "{full_chapter_text}"
@@ -320,7 +314,7 @@ Write a personal, practical guide on how to pray over this chapter and integrate
 ### A Simple 1-Minute Prayer to Start Your Day
 > **"[A unified, powerful 4-sentence daily prayer weaving all three themes of {book} {chapter} together. Amen.]"**
 """
-    return call_groq_safely(prompt, model_id, all_models)
+    return call_groq_safely(prompt)
 
 # --- CHAPTER SUBHEADER ---
 st.markdown(f"<h2 style='text-align: center; margin-top: 15px; margin-bottom: 20px; font-style: italic;'>{selected_book_name} · Chapter {selected_chapter_num}</h2>", unsafe_allow_html=True)
@@ -360,7 +354,7 @@ if st.session_state.current_chunk < total_chunks:
     if st.button(f"Read Verses {v_range}  →", use_container_width=True):
         with st.spinner("Unpacking the themes of this passage..."):
             prev_summary = " | ".join([f"Verses {h['range']}: {h.get('plain_text', '')}" for h in st.session_state.history[-2:]])
-            insight = get_llama_insight(selected_book_name, selected_chapter_num, v_range, plain_text, prev_summary, selected_model, available_models)
+            insight = get_llama_insight(selected_book_name, selected_chapter_num, v_range, plain_text, prev_summary)
             
             st.session_state.history.append({
                 "range": v_range,
@@ -378,7 +372,7 @@ else:
     if not st.session_state.chapter_summary:
         with st.spinner("Synthesizing the Big Picture of the chapter..."):
             full_text = " ".join(verses)
-            st.session_state.chapter_summary = get_chapter_summary(selected_book_name, selected_chapter_num, full_text, selected_model, available_models)
+            st.session_state.chapter_summary = get_chapter_summary(selected_book_name, selected_chapter_num, full_text)
             st.rerun()
             
     if st.session_state.chapter_summary:
@@ -396,7 +390,7 @@ else:
         if st.button("🙏 How can I pray over & apply this chapter?", use_container_width=True):
             with st.spinner("Preparing your personal prayer & application guide..."):
                 full_text = " ".join(verses)
-                prayer_guide = get_prayer_and_application(selected_book_name, selected_chapter_num, full_text, selected_model, available_models)
+                prayer_guide = get_prayer_and_application(selected_book_name, selected_chapter_num, full_text)
                 st.session_state.prayer_guide = prayer_guide
                 st.session_state.prayer_generated = True
                 st.rerun()
