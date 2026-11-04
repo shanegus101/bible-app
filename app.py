@@ -4,9 +4,139 @@ import json
 import os
 from groq import Groq
 
-st.set_page_config(page_title="Llama Bible Study", page_icon="🦙", layout="centered")
-st.title("🦙📖 Bible Study")
+# --- PAGE SETUP ---
+st.set_page_config(page_title="Heirloom Bible Study", page_icon="📜", layout="centered")
 
+# --- CUSTOM VINTAGE / HEIRLOOM CSS ---
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;0,700;1,400&family=Inter:wght@400;500;600&display=swap');
+
+/* Hide default Streamlit clutter for a clean mobile app feel */
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
+
+/* Warm Cream / Parchment App Background */
+.stApp {
+    background-color: #FAF6F0;
+    color: #2C221E;
+}
+
+/* Vintage Serif Headings */
+h1, h2, h3 {
+    font-family: 'Cormorant Garamond', Georgia, serif !important;
+    color: #2C221E !important;
+    font-weight: 600 !important;
+    letter-spacing: -0.01em;
+}
+
+/* Clean Body & Insight Text */
+p, li, div {
+    font-family: 'Inter', sans-serif;
+    color: #4A3F35;
+    line-height: 1.65;
+}
+
+/* Tea-Stained Vintage Card (Matches Your Screenshot!) */
+.vintage-card {
+    background: linear-gradient(135deg, #FBF6E9 0%, #F5DEC0 55%, #F2CFAA 100%);
+    border-radius: 22px;
+    padding: 30px 26px;
+    margin: 22px 0 16px 0;
+    border: 1px solid #E6D2B5;
+    box-shadow: 0 8px 24px rgba(139, 98, 59, 0.08);
+}
+
+.vintage-label {
+    font-family: 'Inter', sans-serif;
+    font-size: 0.72rem;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: #8C735B;
+    margin-bottom: 18px;
+    font-weight: 600;
+}
+
+.vintage-verse-text {
+    font-family: 'Cormorant Garamond', Georgia, serif;
+    font-size: 1.45rem;
+    line-height: 1.55;
+    color: #2C221E;
+    margin-bottom: 18px;
+    font-weight: 500;
+}
+
+.vintage-verse-num {
+    font-size: 0.85rem;
+    color: #9C7A54;
+    vertical-align: super;
+    font-family: 'Inter', sans-serif;
+    font-weight: 600;
+    margin-right: 3px;
+}
+
+.vintage-ref {
+    font-family: 'Inter', sans-serif;
+    font-size: 0.75rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #8C735B;
+    font-weight: 500;
+}
+
+/* Insight Card (Bottom half of your screenshot style) */
+.insight-card {
+    background-color: #FFFDF9;
+    border-radius: 18px;
+    padding: 22px 24px;
+    margin-bottom: 28px;
+    border: 1px solid #EFE6D8;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.02);
+}
+
+/* Heirloom Amber Buttons */
+.stButton > button {
+    background: linear-gradient(135deg, #8C6239 0%, #6E4B2A 100%) !important;
+    color: #FAF6F0 !important;
+    border: none !important;
+    border-radius: 14px !important;
+    padding: 14px 24px !important;
+    font-family: 'Cormorant Garamond', Georgia, serif !important;
+    font-size: 1.25rem !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.03em !important;
+    box-shadow: 0 4px 12px rgba(110, 75, 42, 0.2) !important;
+    transition: all 0.2s ease !important;
+}
+
+.stButton > button:hover {
+    opacity: 0.94 !important;
+    transform: translateY(-1px);
+}
+
+.stButton > button p {
+    color: #FAF6F0 !important;
+    font-family: 'Cormorant Garamond', Georgia, serif !important;
+    font-size: 1.2rem !important;
+}
+
+/* Expander Styling */
+div[data-testid="stExpander"] {
+    background-color: #FFFDF9;
+    border-radius: 14px;
+    border: 1px solid #E6D7C3;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# --- APP HEADER ---
+st.markdown("<div style='text-align: center; padding-top: 10px;'>", unsafe_allow_html=True)
+st.markdown("<div class='vintage-label' style='margin-bottom: 4px;'>HEIRLOOM EDITION</div>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align: center; font-size: 2.5rem; margin-top: 0; padding-top: 0;'>Scripture & Study</h1>", unsafe_allow_html=True)
+st.markdown("</div>", unsafe_allow_html=True)
+
+# --- LOAD BIBLE DATA ---
 BIBLE_FILE = "bible_data.json"
 
 @st.cache_data
@@ -24,23 +154,24 @@ def load_bible():
 
 bible_data = load_bible()
 
-# Automatically pulls your key named 'shanesapi' from Streamlit Secrets
+# Pull API Key
 api_key = st.secrets.get("shanesapi", None)
 
-with st.expander("⚙️ Choose Book & Chapter", expanded=False):
+# --- PASSAGE SELECTOR ---
+with st.expander("📖 Select Book & Chapter", expanded=False):
     if not api_key:
         api_key = st.text_input("Enter Groq API Key:", type="password")
         
     book_names = [book['name'] for book in bible_data]
-    selected_book_name = st.selectbox("Select Book", book_names, index=39)
+    selected_book_name = st.selectbox("Book", book_names, index=39)
     
     selected_book = next(b for b in bible_data if b['name'] == selected_book_name)
     num_chapters = len(selected_book['chapters'])
-    selected_chapter_num = st.selectbox("Select Chapter", range(1, num_chapters + 1), index=7)
+    selected_chapter_num = st.selectbox("Chapter", range(1, num_chapters + 1), index=7)
     
-    chunk_size = st.slider("Verses per section", min_value=3, max_value=10, value=5)
+    chunk_size = st.slider("Verses per reading card", min_value=3, max_value=10, value=5)
     
-    if st.button("🔄 Start / Reset Chapter", use_container_width=True):
+    if st.button("Begin / Reset Chapter", use_container_width=True):
         st.session_state.current_chunk = 0
         st.session_state.history = []
         st.session_state.prayer_generated = False
@@ -57,6 +188,7 @@ verses = selected_book['chapters'][selected_chapter_num - 1]
 chunks = [verses[i:i + chunk_size] for i in range(0, len(verses), chunk_size)]
 total_chunks = len(chunks)
 
+# --- LLAMA (GROQ) HELPER FUNCTIONS ---
 def get_llama_insight(book, chapter, verse_range, text, previous_context):
     client = Groq(api_key=api_key)
     prompt = f"""
@@ -67,9 +199,9 @@ def get_llama_insight(book, chapter, verse_range, text, previous_context):
     Previous sections covered so far: {previous_context if previous_context else "Beginning of the chapter."}
     
     Please provide:
-    1. If this isn't the first section, 1 sentence tying this to what we just read.
-    2. Explain the meaning of these verses in 3-4 short, punchy bullet points (include NASB phrasing/nuance where helpful).
-    3. A 1-sentence 'Takeaway' at the end.
+    1. If this isn't the first section, 1 brief sentence tying this to what we just read.
+    2. Explain the meaning of these verses in 3-4 short, warm, insightful bullet points (mentioning NASB phrasing/nuance where helpful).
+    3. End with a bold 1-sentence 'Takeaway'.
     """
     completion = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -92,7 +224,7 @@ def get_prayer_and_application(book, chapter, full_chapter_text):
     - **How to Apply It** (A practical action for this week)
     - **How to Pray** (A short written prayer)
     
-    End with a **Simple 1-Minute Prayer to Start Your Day** that ties the whole chapter together.
+    End with a **Simple 1-Minute Morning Prayer** that ties the whole chapter together.
     """
     completion = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -103,19 +235,33 @@ def get_prayer_and_application(book, chapter, full_chapter_text):
     )
     return completion.choices[0].message.content
 
-st.subheader(f"📍 {selected_book_name} {selected_chapter_num}")
+# --- CHAPTER SUBHEADER ---
+st.markdown(f"<h2 style='text-align: center; margin-top: 15px; margin-bottom: 20px; font-style: italic;'>{selected_book_name} · Chapter {selected_chapter_num}</h2>", unsafe_allow_html=True)
 
 if not api_key:
-    st.warning("👆 Tap 'Choose Book & Chapter' above to enter your Groq API Key.")
+    st.warning("👆 Tap 'Select Book & Chapter' above to enter your Groq API Key.")
     st.stop()
 
+# --- DISPLAY VINTAGE CARDS & STUDY NOTES ---
 for item in st.session_state.history:
-    with st.container():
-        st.markdown(f"### 📜 Verses {item['range']}")
-        st.info(item['text'])
-        st.markdown(item['insight'])
-        st.divider()
+    # 1. Tea-Stained Scripture Card
+    st.markdown(f"""
+    <div class="vintage-card">
+        <div class="vintage-label">SCRIPTURE READING</div>
+        <div class="vintage-verse-text">{item['html_text']}</div>
+        <div class="vintage-ref">{selected_book_name.upper()} {selected_chapter_num}:{item['range']}</div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # 2. Study Notes Card
+    st.markdown(f"""
+    <div class="insight-card">
+        <div class="vintage-label" style="margin-bottom: 10px;">STUDY NOTES & INSIGHTS</div>
+    """, unsafe_allow_html=True)
+    st.markdown(item['insight'])
+    st.markdown("</div>", unsafe_allow_html=True)
 
+# --- NEXT SECTION BUTTON ---
 if st.session_state.current_chunk < total_chunks:
     idx = st.session_state.current_chunk
     current_verses = chunks[idx]
@@ -123,26 +269,29 @@ if st.session_state.current_chunk < total_chunks:
     end_v = start_v + len(current_verses) - 1
     v_range = f"{start_v}–{end_v}"
     
-    formatted_text = " ".join([f"**({start_v + i})** {v}" for i, v in enumerate(current_verses)])
+    plain_text = " ".join([f"({start_v + i}) {v}" for i, v in enumerate(current_verses)])
+    html_text = " ".join([f"<span class='vintage-verse-num'>{start_v + i}</span>{v}" for i, v in enumerate(current_verses)])
     
-    if st.button(f"Read Verses {v_range} ➡️", type="primary", use_container_width=True):
-        with st.spinner("Llama is studying the text..."):
+    if st.button(f"Read Verses {v_range}  →", use_container_width=True):
+        with st.spinner("Reflecting on the passage..."):
             prev_summary = " | ".join([f"v.{h['range']}" for h in st.session_state.history])
-            insight = get_llama_insight(selected_book_name, selected_chapter_num, v_range, formatted_text, prev_summary)
+            insight = get_llama_insight(selected_book_name, selected_chapter_num, v_range, plain_text, prev_summary)
             
             st.session_state.history.append({
                 "range": v_range,
-                "text": formatted_text,
+                "html_text": html_text,
                 "insight": insight
             })
             st.session_state.current_chunk += 1
             st.rerun()
 
+# --- END OF CHAPTER: PRAYER & APPLICATION ---
 else:
-    st.success("🎉 Chapter Complete!")
+    st.markdown("<div style='text-align: center; margin: 20px 0; font-family: Cormorant Garamond, serif; font-size: 1.3rem; color: #6E4B2A;'>— Chapter Complete —</div>", unsafe_allow_html=True)
+    
     if not st.session_state.prayer_generated:
-        if st.button("🙏 How can I pray & apply this?", type="primary", use_container_width=True):
-            with st.spinner("Writing your prayer & application guide..."):
+        if st.button("🙏 Prayer & Life Application", use_container_width=True):
+            with st.spinner("Preparing your prayer & application guide..."):
                 full_text = " ".join(verses)
                 prayer_guide = get_prayer_and_application(selected_book_name, selected_chapter_num, full_text)
                 st.session_state.prayer_guide = prayer_guide
@@ -150,5 +299,13 @@ else:
                 st.rerun()
                 
     if st.session_state.prayer_generated:
-        st.markdown("## 🌱 Prayer & Life Application")
+        st.markdown("""
+        <div class="vintage-card">
+            <div class="vintage-label">DEVOTIONAL & PRAYER</div>
+            <h2 style="margin-top: 0; margin-bottom: 10px;">Integrating the Word</h2>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown('<div class="insight-card">', unsafe_allow_html=True)
         st.markdown(st.session_state.prayer_guide)
+        st.markdown('</div>', unsafe_allow_html=True)
