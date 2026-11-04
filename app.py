@@ -12,18 +12,15 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;0,700;1,400&family=Inter:wght@400;500;600&display=swap');
 
-/* Hide default Streamlit clutter for a clean mobile app feel */
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
 header {visibility: hidden;}
 
-/* Warm Cream / Parchment App Background */
 .stApp {
     background-color: #FAF6F0;
     color: #2C221E;
 }
 
-/* Vintage Serif Headings */
 h1, h2, h3 {
     font-family: 'Cormorant Garamond', Georgia, serif !important;
     color: #2C221E !important;
@@ -31,14 +28,12 @@ h1, h2, h3 {
     letter-spacing: -0.01em;
 }
 
-/* Clean Body & Insight Text */
 p, li, div {
     font-family: 'Inter', sans-serif;
     color: #4A3F35;
     line-height: 1.65;
 }
 
-/* Tea-Stained Vintage Card (Matches Your Screenshot!) */
 .vintage-card {
     background: linear-gradient(135deg, #FBF6E9 0%, #F5DEC0 55%, #F2CFAA 100%);
     border-radius: 22px;
@@ -85,7 +80,6 @@ p, li, div {
     font-weight: 500;
 }
 
-/* Insight Card (Bottom half of your screenshot style) */
 .insight-card {
     background-color: #FFFDF9;
     border-radius: 18px;
@@ -95,7 +89,6 @@ p, li, div {
     box-shadow: 0 4px 14px rgba(0, 0, 0, 0.02);
 }
 
-/* Heirloom Amber Buttons */
 .stButton > button {
     background: linear-gradient(135deg, #8C6239 0%, #6E4B2A 100%) !important;
     color: #FAF6F0 !important;
@@ -121,7 +114,6 @@ p, li, div {
     font-size: 1.2rem !important;
 }
 
-/* Expander Styling */
 div[data-testid="stExpander"] {
     background-color: #FFFDF9;
     border-radius: 14px;
@@ -154,14 +146,34 @@ def load_bible():
 
 bible_data = load_bible()
 
-# Pull API Key
-api_key = st.secrets.get("shanesapi", None)
+# Pull API Key (strips any accidental whitespace)
+raw_key = st.secrets.get("shanesapi", None)
+api_key = raw_key.strip() if raw_key else None
+
+# Auto-detect available Llama models from Groq
+@st.cache_data
+def get_available_models(_key):
+    try:
+        client = Groq(api_key=_key)
+        models = client.models.list()
+        # Filter out audio/whisper/guard models and prioritize Llama models
+        chat_models = [
+            m.id for m in models.data 
+            if not any(x in m.id.lower() for x in ["whisper", "guard", "tts", "vision", "embed"])
+        ]
+        llama_models = [m for m in chat_models if "llama" in m.lower()]
+        other_models = [m for m in chat_models if "llama" not in m.lower()]
+        return sorted(llama_models, reverse=True) + sorted(other_models)
+    except Exception:
+        return ["meta-llama/llama-4-scout-17b-16e-instruct", "llama-3.1-8b-instant"]
 
 # --- PASSAGE SELECTOR ---
 with st.expander("📖 Select Book & Chapter", expanded=False):
     if not api_key:
-        api_key = st.text_input("Enter Groq API Key:", type="password")
-        
+        input_key = st.text_input("Enter Groq API Key:", type="password")
+        if input_key:
+            api_key = input_key.strip()
+            
     book_names = [book['name'] for book in bible_data]
     selected_book_name = st.selectbox("Book", book_names, index=39)
     
@@ -170,6 +182,12 @@ with st.expander("📖 Select Book & Chapter", expanded=False):
     selected_chapter_num = st.selectbox("Chapter", range(1, num_chapters + 1), index=7)
     
     chunk_size = st.slider("Verses per reading card", min_value=3, max_value=10, value=5)
+    
+    if api_key:
+        available_models = get_available_models(api_key)
+        selected_model = st.selectbox("AI Model", available_models, index=0)
+    else:
+        selected_model = "llama-3.1-8b-instant"
     
     if st.button("Begin / Reset Chapter", use_container_width=True):
         st.session_state.current_chunk = 0
@@ -189,7 +207,7 @@ chunks = [verses[i:i + chunk_size] for i in range(0, len(verses), chunk_size)]
 total_chunks = len(chunks)
 
 # --- LLAMA (GROQ) HELPER FUNCTIONS ---
-def get_llama_insight(book, chapter, verse_range, text, previous_context):
+def get_llama_insight(book, chapter, verse_range, text, previous_context, model_id):
     client = Groq(api_key=api_key)
     prompt = f"""
     We are doing a step-by-step Bible study of {book} Chapter {chapter}.
@@ -204,7 +222,7 @@ def get_llama_insight(book, chapter, verse_range, text, previous_context):
     3. End with a bold 1-sentence 'Takeaway'.
     """
     completion = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model=model_id,
         messages=[
             {"role": "system", "content": "You are a warm, clear, and insightful Bible study teacher."},
             {"role": "user", "content": prompt}
@@ -212,7 +230,7 @@ def get_llama_insight(book, chapter, verse_range, text, previous_context):
     )
     return completion.choices[0].message.content
 
-def get_prayer_and_application(book, chapter, full_chapter_text):
+def get_prayer_and_application(book, chapter, full_chapter_text, model_id):
     client = Groq(api_key=api_key)
     prompt = f"""
     We just finished studying {book} Chapter {chapter}. 
@@ -227,7 +245,7 @@ def get_prayer_and_application(book, chapter, full_chapter_text):
     End with a **Simple 1-Minute Morning Prayer** that ties the whole chapter together.
     """
     completion = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model=model_id,
         messages=[
             {"role": "system", "content": "You are a wise, practical Christian pastor helping someone apply Scripture to their daily life."},
             {"role": "user", "content": prompt}
@@ -244,7 +262,6 @@ if not api_key:
 
 # --- DISPLAY VINTAGE CARDS & STUDY NOTES ---
 for item in st.session_state.history:
-    # 1. Tea-Stained Scripture Card
     st.markdown(f"""
     <div class="vintage-card">
         <div class="vintage-label">SCRIPTURE READING</div>
@@ -253,7 +270,6 @@ for item in st.session_state.history:
     </div>
     """, unsafe_allow_html=True)
     
-    # 2. Study Notes Card
     st.markdown(f"""
     <div class="insight-card">
         <div class="vintage-label" style="margin-bottom: 10px;">STUDY NOTES & INSIGHTS</div>
@@ -275,7 +291,7 @@ if st.session_state.current_chunk < total_chunks:
     if st.button(f"Read Verses {v_range}  →", use_container_width=True):
         with st.spinner("Reflecting on the passage..."):
             prev_summary = " | ".join([f"v.{h['range']}" for h in st.session_state.history])
-            insight = get_llama_insight(selected_book_name, selected_chapter_num, v_range, plain_text, prev_summary)
+            insight = get_llama_insight(selected_book_name, selected_chapter_num, v_range, plain_text, prev_summary, selected_model)
             
             st.session_state.history.append({
                 "range": v_range,
@@ -293,7 +309,7 @@ else:
         if st.button("🙏 Prayer & Life Application", use_container_width=True):
             with st.spinner("Preparing your prayer & application guide..."):
                 full_text = " ".join(verses)
-                prayer_guide = get_prayer_and_application(selected_book_name, selected_chapter_num, full_text)
+                prayer_guide = get_prayer_and_application(selected_book_name, selected_chapter_num, full_text, selected_model)
                 st.session_state.prayer_guide = prayer_guide
                 st.session_state.prayer_generated = True
                 st.rerun()
