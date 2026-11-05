@@ -168,7 +168,6 @@ CHAPTER_TEXT_CACHE_FILE = "chapter_text_cache.json"
 
 @st.cache_data
 def load_bible_structure():
-    # Uses KJV structure locally as a reliable 66-book index & offline fallback (replaces BBE!)
     if not os.path.exists(BIBLE_STRUCTURE_FILE):
         url = "https://raw.githubusercontent.com/thiagobodruk/bible/master/json/en_kjv.json"
         response = requests.get(url, timeout=15)
@@ -197,7 +196,6 @@ def save_json_cache(filepath, cache_dict):
         pass
 
 def clean_verse_html(raw_text):
-    # Remove Strong's numbers, footnote tags, and HTML tags from API text
     text = re.sub(r'<S>\d+</S>', '', raw_text)
     text = re.sub(r'<sup>.*?</sup>', '', text)
     text = re.sub(r'<[\^>]+>', '', text)
@@ -211,12 +209,11 @@ if "chapter_text_cache" not in st.session_state:
     st.session_state.chapter_text_cache = load_json_cache(CHAPTER_TEXT_CACHE_FILE)
 
 def get_chapter_verses(book_name, chapter_num, translation="NASB"):
-    """Fetches exact NASB, ESV, or BSB verses from Bolls.life API with local caching and offline fallback."""
     cache_key = f"{translation}_{book_name}_{chapter_num}"
     if cache_key in st.session_state.chapter_text_cache:
         return st.session_state.chapter_text_cache[cache_key]
 
-    book_idx = book_names.index(book_name) + 1  # 1-indexed (Genesis=1, Matthew=40, etc.)
+    book_idx = book_names.index(book_name) + 1
     try:
         url = f"https://bolls.life/get-text/{translation}/{book_idx}/{chapter_num}/"
         resp = requests.get(url, timeout=8)
@@ -230,7 +227,6 @@ def get_chapter_verses(book_name, chapter_num, translation="NASB"):
     except Exception:
         pass
 
-    # Offline fallback to local structure file if user has no internet connection
     book_obj = next(b for b in bible_data if b['name'] == book_name)
     return book_obj['chapters'][chapter_num - 1]
 
@@ -320,26 +316,31 @@ def save_reading_progress(book, chapter, start_section_idx=0, translation="NASB"
         </script>
     """, height=0)
 
-# --- STRICT DEVOTIONAL PROMPTS ---
+# --- STRICT DEVOTIONAL PROMPTS & MODEL ROUTER ---
 SYSTEM_PROMPT = """You are an insightful, warm, and theologically precise Bible study teacher writing a clean devotional guide.
 CRITICAL RULES:
-1. NEVER include conversational filler like "Sure, let's break down..." or "Here is the analysis".
-2. Quote directly from the provided Bible text so your quotes match the exact translation displayed to the reader.
-3. Pay strict attention to the text: WHO is speaking, TO WHOM they are speaking (e.g., praying to the Father vs. speaking to disciples vs. rebuking crowds), and WHAT is actually said in each specific verse.
-4. NEVER hallucinate titles, phrases, or events that are not present in the exact verses provided.
-5. NEVER repeat or duplicate the same sub-theme across two sections. Each sub-theme must unpack a distinct movement of the text."""
+1. NEVER include conversational filler like "Sure, let's break down..." or "Here is the analysis". Start IMMEDIATELY with `### The Big Picture:`.
+2. Quote ONLY from the exact Bible verses provided in the prompt. NEVER import famous quotes from parallel Gospels or other chapters (for example, do not quote Mark's "The Sabbath was made for man" when analyzing Matthew 12).
+3. Pay strict attention to WHO is speaking and TO WHOM in each verse.
+4. NEVER repeat the same verse range, action, or meaning in Sub-Theme 1 and Sub-Theme 2."""
 
 def strip_hidden_tags(text):
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
     text = re.sub(r'<verify>.*?</verify>', '', text, flags=re.DOTALL)
+    # Remove accidental markdown code fences if a model wraps its response
+    text = re.sub(r'^```(?:markdown)?\s*', '', text.strip())
+    text = re.sub(r'\s*```$', '', text.strip())
     return text.strip()
 
 def call_groq_safely(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.3):
+    # Strictly prioritize high-reasoning 70B/32B models over small 8B models
     preferred_priority = [
         "llama-3.3-70b-versatile",
-        "deepseek-r1-distill-llama-70b",
         "qwen/qwen3-32b",
+        "deepseek-r1-distill-llama-70b",
         "llama-3.1-70b-versatile",
+        "meta-llama/llama-4-maverick-17b-128e-instruct",
+        "meta-llama/llama-4-scout-17b-16e-instruct",
         "gemma2-9b-it",
         "llama-3.1-8b-instant"
     ]
@@ -352,10 +353,10 @@ def call_groq_safely(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.3):
             live_models = preferred_priority
 
         top_tier = [m for m in preferred_priority if m in live_models]
-        other_70b = [m for m in live_models if m not in top_tier and ("70b" in m.lower() or "32b" in m.lower()) and "guard" not in m.lower()]
-        other_chat = [m for m in live_models if m not in top_tier and m not in other_70b and not any(x in m.lower() for x in ["whisper", "orpheus", "tts", "guard", "embed", "playai"])]
+        other_large = [m for m in live_models if m not in top_tier and any(sz in m.lower() for sz in ["70b", "32b", "17b"]) and "guard" not in m.lower()]
+        other_chat = [m for m in live_models if m not in top_tier and m not in other_large and not any(x in m.lower() for x in ["whisper", "orpheus", "tts", "guard", "embed", "playai"])]
         
-        candidate_models = top_tier + other_70b + other_chat
+        candidate_models = top_tier + other_large + other_chat
 
         for model_id in candidate_models:
             try:
@@ -472,42 +473,105 @@ def format_dropdown_label(sec):
     v_str = f"v. {sec['start']}–{sec['end']}" if sec['start'] != sec['end'] else f"v. {sec['start']}"
     return f"{v_str} · {sec['title']}"
 
-# --- SELF-VERIFYING DEVOTIONAL ANALYSIS GENERATOR ---
-def get_llama_insight(book, chapter, verse_range, text, previous_context, translation="NASB"):
-    prompt = f"""
-Passage: {book} {chapter}:{verse_range} ({translation} Translation)
-Exact Verse Text to Analyze: "{text}"
+# --- TWO-PASS GENERATOR + THEOLOGICAL CRITIC ENGINE ---
+def get_llama_insight(book, chapter, start_v, end_v, text, previous_context, translation="NASB"):
+    v_range = f"{start_v}–{end_v}" if start_v != end_v else f"{start_v}"
+    num_verses = end_v - start_v + 1
+
+    # Calculate default non-overlapping midpoint so the AI knows it MUST split the verses sequentially
+    mid_v = start_v + (num_verses // 2) - 1
+    if mid_v < start_v:
+        mid_v = start_v
+    part1_hint = f"{start_v}–{mid_v}" if start_v != mid_v else f"{start_v}"
+    part2_hint = f"{mid_v + 1}–{end_v}" if (mid_v + 1) != end_v else f"{end_v}"
+
+    # PASS 1: Generate Initial Devotional Breakdown
+    if num_verses <= 3:
+        # Very short 1-3 verse passage: use 1 Sub-Theme so it never duplicates
+        draft_prompt = f"""
+Passage: {book} {chapter}:{v_range} ({translation} Translation)
+Exact Verse Text: "{text}"
 Previous context in this chapter: {previous_context if previous_context else "This is the opening section of the chapter."}
 
-STEP 1 — INTERNAL THEOLOGICAL & TEXTUAL VERIFICATION (Write inside <verify>...</verify> tags first):
-Before writing the devotional, briefly verify inside <verify>...</verify> tags:
-1. Who is speaking and to whom in each specific verse? (e.g., Is Jesus praying to the Father, speaking to disciples, or addressing the crowds? Do not confuse them!)
-2. How does this passage naturally divide into 2 distinct sequential parts (Verses X–Y and Verses Y–Z)? What is the distinct action/truth in Part 1 vs. Part 2 so that Part 1 and Part 2 NEVER repeat the same theme? (If the passage is only 1–3 verses long and contains only one single thought, note that only 1 Sub-Theme should be used.)
-3. What are the exact phrases in the provided {translation} text above so nothing is misquoted or hallucinated from other passages?
+Write a clean, theme-driven devotional breakdown of ONLY {book} {chapter}:{v_range} using this EXACT Markdown template:
 
-STEP 2 — WRITE THE DEVOTIONAL (Write AFTER the closing </verify> tag):
-Using your verification, write a clean, theme-driven devotional breakdown of ONLY {book} {chapter}:{verse_range} using this EXACT Markdown template:
+### The Big Picture: [Short, Compelling Theme Title]
+[2-3 clear sentences setting the scene and connecting to what happened right before this.]
+
+### 1. [Short Sub-Theme Title (Verses {v_range})]
+* **The Context:** [1-2 sentences explaining who is speaking, to whom, and cultural/historical background.]
+* **What Happens:** [1-2 sentences explaining the exact action or dialogue, quoting key phrases directly from the provided {translation} text.]
+* **The Meaning:** [2-3 sentences unpacking the deeper spiritual truth of these verses.]
+
+### Summary
+* **[Key Point 1]:** [1 punchy sentence]
+* **[Key Point 2]:** [1 punchy sentence]
+
+**Ultimately:** [1 final, memorable sentence summarizing what {book} {chapter}:{v_range} teaches us about following God.]
+"""
+    else:
+        draft_prompt = f"""
+Passage: {book} {chapter}:{v_range} ({translation} Translation)
+Exact Verse Text: "{text}"
+Previous context in this chapter: {previous_context if previous_context else "This is the opening section of the chapter."}
+
+CRITICAL PARTITION RULE:
+You MUST divide {book} {chapter}:{v_range} into TWO sequential, NON-OVERLAPPING verse ranges (for example, Part 1 covering Verses {part1_hint} and Part 2 covering Verses {part2_hint}, or wherever the natural shift in speaker/action occurs).
+- NEVER put "(Verses {v_range})" on both Part 1 and Part 2!
+- Part 1 must ONLY analyze the first group of verses (e.g., the setup, question, or prayer).
+- Part 2 must ONLY analyze the second group of verses (e.g., the answer, miracle, or invitation).
+- NEVER quote verses from other chapters or other Gospels (e.g., do NOT quote Mark 2:27 "The Sabbath was made for man" if it is not in the text above!).
+
+Write the breakdown using this EXACT Markdown template:
 
 ### The Big Picture: [Create a Short, Compelling Theme Title]
 [2-3 clear sentences setting the scene. If this is not the first section, smoothly connect it to what happened right before this. Explain the main tension or big idea of these verses.]
 
-### [1. Distinct Sub-Theme Title for First Movement (Verses X–Y)]
-* **The Context:** [1-2 sentences explaining who is speaking, to whom, and important cultural/historical background for verses X–Y.]
-* **What Happens:** [1-2 sentences explaining the exact action, prayer, or dialogue in verses X–Y, quoting key phrases directly from the text above.]
-* **The Meaning:** [2-3 sentences unpacking the deeper spiritual/theological truth of verses X–Y.]
+### 1. [Short Sub-Theme Title for First Half (Verses {start_v}–X)]
+* **The Context:** [1-2 sentences explaining who is involved, who is speaking to whom, and important cultural/historical background for ONLY verses {start_v}–X.]
+* **What Happens:** [1-2 sentences explaining the action, prayer, or dialogue in ONLY verses {start_v}–X, quoting key {translation} phrases from the text above.]
+* **The Meaning:** [2-3 sentences unpacking the deeper spiritual truth of verses {start_v}–X.]
 
-### [2. Distinct Sub-Theme Title for Second Movement (Verses Y–Z)]
-* **The Context:** [1-2 sentences explaining the shift in focus, audience, or tone in verses Y–Z.]
-* **What Happens:** [1-2 sentences on the specific action, invitation, or response in verses Y–Z, quoting key phrases directly from the text above.]
-* **The Meaning:** [2-3 sentences unpacking the heart of the lesson in verses Y–Z.]
+### 2. [Short Sub-Theme Title for Second Half (Verses Y–{end_v})]
+* **The Context:** [1-2 sentences of background or the shift in tone/focus in ONLY verses Y–{end_v}.]
+* **What Happens:** [1-2 sentences on the action, response, or resolution in ONLY verses Y–{end_v}, quoting key {translation} phrases from the text above.]
+* **The Meaning:** [2-3 sentences unpacking the heart of the lesson in verses Y–{end_v}.]
 
 ### Summary
 * **[Key Contrast or Point 1]:** [1 punchy sentence]
 * **[Key Contrast or Point 2]:** [1 punchy sentence]
 
-**Ultimately:** [1 final, memorable sentence summarizing what {book} {chapter}:{verse_range} teaches us about following God.]
+**Ultimately:** [1 final, memorable sentence summarizing what {book} {chapter}:{v_range} teaches us about following God.]
 """
-    return call_groq_safely(prompt)
+
+    draft = call_groq_safely(draft_prompt, temperature=0.3)
+
+    # PASS 2: Automated Theological & Structural Critic Check
+    # Checks if the draft has any flaws (repeated verse ranges, missing bullets, or cross-passage hallucinations)
+    critic_prompt = f"""You are a strict Theological & Editorial Reviewer for a Bible study app.
+Review the following DRAFT devotional against the EXACT BIBLICAL TEXT of {book} {chapter}:{v_range} ({translation}).
+
+EXACT BIBLICAL TEXT ({book} {chapter}:{v_range}):
+"{text}"
+
+DRAFT DEVOTIONAL TO REVIEW:
+{draft}
+
+AUDIT & FIX CHECKLIST:
+1. NO DUPLICATE VERSE RANGES OR REPEATED CONTENT: Check the headings `### 1. ...` and `### 2. ...`. Did the draft put the full verse range `({v_range})` on both headings, or repeat the same "What Happens" / "The Meaning" in both sections? If so, REWRITE Section 1 so it strictly covers ONLY the first part of the passage (e.g., Verses {part1_hint}) and REWRITE Section 2 so it strictly covers ONLY the second part (e.g., Verses {part2_hint}) with zero repetition!
+2. NO EXTERNAL HALLUCINATIONS: Did the draft claim Jesus or the text said something that is NOT in the Exact Biblical Text above (such as quoting Mark 2:27 "The Sabbath was made for man" when the text above actually argues from a sheep falling into a pit)? If so, remove the foreign quote/claim and ground the explanation strictly in what is written in the Exact Biblical Text above!
+3. SPEAKER / AUDIENCE ACCURACY: Ensure the draft accurately identifies who is speaking and to whom (e.g., praying to the Father vs. questioning the Pharisees vs. commanding the man).
+4. STRICT MARKDOWN TEMPLATE: Ensure the output uses the exact headings (`### The Big Picture: ...`, `### 1. ...`, `### 2. ...`, `### Summary`) and exact bullet labels (`* **The Context:**`, `* **What Happens:**`, `* **The Meaning:**`, and `**Ultimately:**` at the end).
+
+OUTPUT RULE:
+Output ONLY the final, corrected Markdown devotional (with no intro chatter, no "Here is the corrected version", and no notes about what you fixed). If the draft was already 100% accurate, distinct, and properly formatted, output it as-is."""
+
+    verified_output = call_groq_safely(
+        critic_prompt,
+        system_prompt="You are a precise biblical editor. Output ONLY the final polished Markdown devotional.",
+        temperature=0.15
+    )
+    return verified_output
 
 def get_chapter_summary(book, chapter, full_chapter_text):
     prompt = f"""
@@ -677,7 +741,7 @@ if st.session_state.current_chunk < total_chunks:
     html_text = " ".join([f"<span class='vintage-verse-num'>{start_v + i}</span>{v}" for i, v in enumerate(current_verses)])
     
     if st.button(f"Read v. {v_range} · {sec_title}  →", use_container_width=True):
-        with st.spinner(f"Studying {selected_book_name} {selected_chapter_num}:{v_range}..."):
+        with st.spinner(f"Studying & verifying {selected_book_name} {selected_chapter_num}:{v_range}..."):
             if st.session_state.history:
                 prev_summary = " | ".join([f"Verses {h['range']}: {h.get('plain_text', '')}" for h in st.session_state.history[-2:]])
             elif start_v > 1:
@@ -686,7 +750,15 @@ if st.session_state.current_chunk < total_chunks:
             else:
                 prev_summary = ""
                 
-            insight = get_llama_insight(selected_book_name, selected_chapter_num, v_range, plain_text, prev_summary, current_trans)
+            insight = get_llama_insight(
+                selected_book_name,
+                selected_chapter_num,
+                start_v,
+                end_v,
+                plain_text,
+                prev_summary,
+                current_trans
+            )
             
             st.session_state.history.append({
                 "title": sec_title,
