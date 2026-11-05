@@ -43,14 +43,20 @@ strong {
     font-weight: 600;
 }
 
-/* Fix mobile dropdown text truncation so verse numbers & titles are always readable */
-div[data-baseweb="select"] span,
-ul[data-testid="stSelectboxVirtualDropdown"] li {
+/* Ensure mobile dropdown options wrap cleanly and never clip on the right */
+div[data-baseweb="select"] > div {
+    min-height: 44px;
+}
+div[data-baseweb="popover"] li,
+ul[data-testid="stSelectboxVirtualDropdown"] li,
+ul[data-testid="stSelectboxVirtualDropdown"] li div,
+ul[data-testid="stSelectboxVirtualDropdown"] li span {
     white-space: normal !important;
-    word-wrap: break-word !important;
+    overflow-wrap: anywhere !important;
+    text-overflow: unset !important;
     line-height: 1.35 !important;
-    padding-top: 4px !important;
-    padding-bottom: 4px !important;
+    height: auto !important;
+    font-size: 0.92rem !important;
 }
 
 .vintage-card {
@@ -155,43 +161,80 @@ st.markdown("<div class='vintage-label' style='margin-bottom: 4px;'>HEIRLOOM EDI
 st.markdown("<h1 style='text-align: center; font-size: 2.5rem; margin-top: 0; padding-top: 0;'>Scripture & Study</h1>", unsafe_allow_html=True)
 st.markdown("</div>", unsafe_allow_html=True)
 
-# --- LOAD BIBLE DATA & PERSISTENT SECTION CACHE ---
-BIBLE_FILE = "bible_data.json"
-SECTIONS_CACHE_FILE = "sections_cache.json"
+# --- LOAD BIBLE STRUCTURE & NASB/ESV TEXT ENGINE ---
+BIBLE_STRUCTURE_FILE = "bible_structure_kjv.json"
+SECTIONS_CACHE_FILE = "sections_cache_v3.json"
+CHAPTER_TEXT_CACHE_FILE = "chapter_text_cache.json"
 
 @st.cache_data
-def load_bible():
-    if not os.path.exists(BIBLE_FILE):
-        url = "https://raw.githubusercontent.com/thiagobodruk/bible/master/json/en_bbe.json"
-        response = requests.get(url)
+def load_bible_structure():
+    # Uses KJV structure locally as a reliable 66-book index & offline fallback (replaces BBE!)
+    if not os.path.exists(BIBLE_STRUCTURE_FILE):
+        url = "https://raw.githubusercontent.com/thiagobodruk/bible/master/json/en_kjv.json"
+        response = requests.get(url, timeout=15)
         data = json.loads(response.content.decode('utf-8-sig'))
-        with open(BIBLE_FILE, "w", encoding="utf-8") as f:
+        with open(BIBLE_STRUCTURE_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f)
     else:
-        with open(BIBLE_FILE, "r", encoding="utf-8") as f:
+        with open(BIBLE_STRUCTURE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     return data
 
-def load_persistent_sections():
-    if os.path.exists(SECTIONS_CACHE_FILE):
+def load_json_cache(filepath):
+    if os.path.exists(filepath):
         try:
-            with open(SECTIONS_CACHE_FILE, "r", encoding="utf-8") as f:
+            with open(filepath, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             return {}
     return {}
 
-def save_persistent_sections(cache_dict):
+def save_json_cache(filepath, cache_dict):
     try:
-        with open(SECTIONS_CACHE_FILE, "w", encoding="utf-8") as f:
+        with open(filepath, "w", encoding="utf-8") as f:
             json.dump(cache_dict, f)
     except Exception:
         pass
 
-bible_data = load_bible()
+def clean_verse_html(raw_text):
+    # Remove Strong's numbers, footnote tags, and HTML tags from API text
+    text = re.sub(r'<S>\d+</S>', '', raw_text)
+    text = re.sub(r'<sup>.*?</sup>', '', text)
+    text = re.sub(r'<[\^>]+>', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+bible_data = load_bible_structure()
 book_names = [book['name'] for book in bible_data]
 
-# --- API KEY HANDLING (Supports primary 'shanesapi' + optional backup 'shanesapi2') ---
+if "chapter_text_cache" not in st.session_state:
+    st.session_state.chapter_text_cache = load_json_cache(CHAPTER_TEXT_CACHE_FILE)
+
+def get_chapter_verses(book_name, chapter_num, translation="NASB"):
+    """Fetches exact NASB, ESV, or BSB verses from Bolls.life API with local caching and offline fallback."""
+    cache_key = f"{translation}_{book_name}_{chapter_num}"
+    if cache_key in st.session_state.chapter_text_cache:
+        return st.session_state.chapter_text_cache[cache_key]
+
+    book_idx = book_names.index(book_name) + 1  # 1-indexed (Genesis=1, Matthew=40, etc.)
+    try:
+        url = f"https://bolls.life/get-text/{translation}/{book_idx}/{chapter_num}/"
+        resp = requests.get(url, timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list) and len(data) > 0:
+                cleaned_verses = [clean_verse_html(item.get("text", "")) for item in data]
+                st.session_state.chapter_text_cache[cache_key] = cleaned_verses
+                save_json_cache(CHAPTER_TEXT_CACHE_FILE, st.session_state.chapter_text_cache)
+                return cleaned_verses
+    except Exception:
+        pass
+
+    # Offline fallback to local structure file if user has no internet connection
+    book_obj = next(b for b in bible_data if b['name'] == book_name)
+    return book_obj['chapters'][chapter_num - 1]
+
+# --- API KEY HANDLING ---
 api_keys = []
 for secret_name in ["shanesapi", "shanesapi2", "backup_api"]:
     val = st.secrets.get(secret_name, None)
@@ -204,12 +247,12 @@ if not api_keys and st.session_state.get("user_api_key"):
 has_api_key = len(api_keys) > 0
 
 # --- INITIALIZE SESSION STATE & MEMORY ---
-if "working_model" not in st.session_state:
-    st.session_state.working_model = None
 if "sections_cache" not in st.session_state:
-    st.session_state.sections_cache = load_persistent_sections()
+    st.session_state.sections_cache = load_json_cache(SECTIONS_CACHE_FILE)
 if "scroll_to_top" not in st.session_state:
     st.session_state.scroll_to_top = False
+if "translation" not in st.session_state:
+    st.session_state.translation = st.query_params.get("trans", "NASB")
 
 query_book = st.query_params.get("book", None)
 query_chapter = st.query_params.get("chapter", None)
@@ -257,9 +300,10 @@ if st.session_state.scroll_to_top:
     """, height=0)
     st.session_state.scroll_to_top = False
 
-def save_reading_progress(book, chapter, start_section_idx=0):
+def save_reading_progress(book, chapter, start_section_idx=0, translation="NASB"):
     st.session_state.selected_book_name = book
     st.session_state.selected_chapter_num = chapter
+    st.session_state.translation = translation
     st.session_state.current_chunk = start_section_idx
     st.session_state.history = []
     st.session_state.chapter_summary = None
@@ -268,6 +312,7 @@ def save_reading_progress(book, chapter, start_section_idx=0):
     st.session_state.scroll_to_top = True
     st.query_params["book"] = book
     st.query_params["chapter"] = str(chapter)
+    st.query_params["trans"] = translation
     components.html(f"""
         <script>
             localStorage.setItem('heirloom_book', "{book}");
@@ -276,30 +321,42 @@ def save_reading_progress(book, chapter, start_section_idx=0):
     """, height=0)
 
 # --- STRICT DEVOTIONAL PROMPTS ---
-SYSTEM_PROMPT = """You are an insightful, warm, and clear Bible study teacher writing a clean devotional guide.
+SYSTEM_PROMPT = """You are an insightful, warm, and theologically precise Bible study teacher writing a clean devotional guide.
 CRITICAL RULES:
-1. NEVER include conversational filler like "Sure, let's break down...", "Here is the analysis", or "In this request". Start IMMEDIATELY with the first heading.
-2. Quote or reference the NASB (New American Standard Bible) wording when discussing the text.
-3. Keep explanations minimalistic, grounded in historical/cultural context, and deeply practical. Do not hallucinate events from other chapters."""
+1. NEVER include conversational filler like "Sure, let's break down..." or "Here is the analysis".
+2. Quote directly from the provided Bible text so your quotes match the exact translation displayed to the reader.
+3. Pay strict attention to the text: WHO is speaking, TO WHOM they are speaking (e.g., praying to the Father vs. speaking to disciples vs. rebuking crowds), and WHAT is actually said in each specific verse.
+4. NEVER hallucinate titles, phrases, or events that are not present in the exact verses provided.
+5. NEVER repeat or duplicate the same sub-theme across two sections. Each sub-theme must unpack a distinct movement of the text."""
 
-# Cycles through all API keys and models automatically so you never hit a wall
-def call_groq_safely(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.4):
+def strip_hidden_tags(text):
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<verify>.*?</verify>', '', text, flags=re.DOTALL)
+    return text.strip()
+
+def call_groq_safely(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.3):
+    preferred_priority = [
+        "llama-3.3-70b-versatile",
+        "deepseek-r1-distill-llama-70b",
+        "qwen/qwen3-32b",
+        "llama-3.1-70b-versatile",
+        "gemma2-9b-it",
+        "llama-3.1-8b-instant"
+    ]
     errors = []
     for key_idx, current_key in enumerate(api_keys):
         client = Groq(api_key=current_key)
         try:
             live_models = [m.id for m in client.models.list().data]
         except Exception:
-            live_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
-            
-        llama_first = [m for m in live_models if "llama" in m.lower() and "guard" not in m.lower()]
-        other_chat = [m for m in live_models if m not in llama_first and not any(x in m.lower() for x in ["whisper", "orpheus", "tts", "guard", "embed", "playai"])]
-        everything_else = [m for m in live_models if m not in llama_first and m not in other_chat]
+            live_models = preferred_priority
+
+        top_tier = [m for m in preferred_priority if m in live_models]
+        other_70b = [m for m in live_models if m not in top_tier and ("70b" in m.lower() or "32b" in m.lower()) and "guard" not in m.lower()]
+        other_chat = [m for m in live_models if m not in top_tier and m not in other_70b and not any(x in m.lower() for x in ["whisper", "orpheus", "tts", "guard", "embed", "playai"])]
         
-        candidate_models = llama_first + other_chat + everything_else
-        if st.session_state.working_model:
-            candidate_models = [st.session_state.working_model] + [m for m in candidate_models if m != st.session_state.working_model]
-            
+        candidate_models = top_tier + other_70b + other_chat
+
         for model_id in candidate_models:
             try:
                 completion = client.chat.completions.create(
@@ -311,9 +368,7 @@ def call_groq_safely(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.4):
                     ]
                 )
                 content = completion.choices[0].message.content
-                if "<think>" in content and "</think>" in content:
-                    content = content.split("</think>")[-1].strip()
-                st.session_state.working_model = model_id
+                content = strip_hidden_tags(content)
                 return content
             except Exception as e:
                 errors.append(f"Key{key_idx+1}/{model_id}: {str(e)}")
@@ -347,7 +402,7 @@ def enforce_max_chunk_size(sections, max_verses=18):
                 p_end = min(start + (p + 1) * part_size - 1, end)
                 if p_start <= p_end:
                     final_sections.append({
-                        "title": f"{title} (Pt. {p + 1})",
+                        "title": f"{title} ({p + 1})",
                         "start": p_start,
                         "end": p_end
                     })
@@ -363,12 +418,12 @@ def get_chapter_sections(book, chapter, verses_list):
         return build_fallback_sections(total_verses)
 
     numbered_text = "\n".join([f"{i+1}. {v}" for i, v in enumerate(verses_list)])
-    prompt = f"""Divide {book} Chapter {chapter} ({total_verses} verses total, 1 to {total_verses}) into its natural biblical thematic subheaders (pericopes), similar to an NASB Study Bible.
+    prompt = f"""Divide {book} Chapter {chapter} ({total_verses} verses total, 1 to {total_verses}) into its natural biblical thematic subheaders (pericopes), matching standard NASB/ESV Study Bible section divisions.
 
 CRITICAL RULES:
 1. Cover every verse from 1 to {total_verses} in sequential order with NO gaps and NO overlaps.
-2. Keep each "title" VERY SHORT and punchy (2 to 5 words maximum, e.g., "John's Questions", "Jesus' Tribute to John", "The Parable of the Sower").
-3. MAXIMUM 18 verses per section. If a section is longer than 18 verses, split it into consecutive parts (e.g., "Sermon on the Mount (Pt. 1)").
+2. Keep each "title" ULTRA-SHORT (maximum 2 to 4 words, under 24 characters! Examples: "John's Questions", "Tribute to John", "Woes to Cities", "Come to Me").
+3. Do NOT over-fragment short chapters: a typical chapter should have 3 to 5 natural pericopes (each 5 to 16 verses long), unless a pericope exceeds 18 verses.
 4. Return ONLY a valid JSON array of objects with keys "title" (string), "start" (integer), and "end" (integer).
 
 Chapter Text:
@@ -398,13 +453,13 @@ Chapter Text:
                     break
             if expected_start <= total_verses:
                 validated.append({
-                    "title": "Concluding Verses",
+                    "title": "Closing Verses",
                     "start": expected_start,
                     "end": total_verses
                 })
             final_sections = enforce_max_chunk_size(validated, max_verses=18)
             st.session_state.sections_cache[cache_key] = final_sections
-            save_persistent_sections(st.session_state.sections_cache)
+            save_json_cache(SECTIONS_CACHE_FILE, st.session_state.sections_cache)
             return final_sections
     except Exception:
         pass
@@ -417,27 +472,34 @@ def format_dropdown_label(sec):
     v_str = f"v. {sec['start']}–{sec['end']}" if sec['start'] != sec['end'] else f"v. {sec['start']}"
     return f"{v_str} · {sec['title']}"
 
-# --- DEVOTIONAL ANALYSIS GENERATORS ---
-def get_llama_insight(book, chapter, section_title, verse_range, text, previous_context):
+# --- SELF-VERIFYING DEVOTIONAL ANALYSIS GENERATOR ---
+def get_llama_insight(book, chapter, verse_range, text, previous_context, translation="NASB"):
     prompt = f"""
-Passage: {book} {chapter}:{verse_range} ({section_title})
-Text: "{text}"
+Passage: {book} {chapter}:{verse_range} ({translation} Translation)
+Exact Verse Text to Analyze: "{text}"
 Previous context in this chapter: {previous_context if previous_context else "This is the opening section of the chapter."}
 
-Write a clean, theme-driven devotional breakdown of ONLY {book} {chapter}:{verse_range} using this EXACT Markdown template (if the passage is under 5 verses, you may use 1 Sub-Theme section; otherwise use 2 Sub-Theme sections):
+STEP 1 — INTERNAL THEOLOGICAL & TEXTUAL VERIFICATION (Write inside <verify>...</verify> tags first):
+Before writing the devotional, briefly verify inside <verify>...</verify> tags:
+1. Who is speaking and to whom in each specific verse? (e.g., Is Jesus praying to the Father, speaking to disciples, or addressing the crowds? Do not confuse them!)
+2. How does this passage naturally divide into 2 distinct sequential parts (Verses X–Y and Verses Y–Z)? What is the distinct action/truth in Part 1 vs. Part 2 so that Part 1 and Part 2 NEVER repeat the same theme? (If the passage is only 1–3 verses long and contains only one single thought, note that only 1 Sub-Theme should be used.)
+3. What are the exact phrases in the provided {translation} text above so nothing is misquoted or hallucinated from other passages?
+
+STEP 2 — WRITE THE DEVOTIONAL (Write AFTER the closing </verify> tag):
+Using your verification, write a clean, theme-driven devotional breakdown of ONLY {book} {chapter}:{verse_range} using this EXACT Markdown template:
 
 ### The Big Picture: [Create a Short, Compelling Theme Title]
 [2-3 clear sentences setting the scene. If this is not the first section, smoothly connect it to what happened right before this. Explain the main tension or big idea of these verses.]
 
-### [1. Short Sub-Theme Title (Verses X–Y)]
-* **The Context:** [1-2 sentences explaining who is involved or important cultural/historical background.]
-* **What Happens:** [1-2 sentences explaining the action or dialogue, quoting key NASB phrases.]
-* **The Meaning:** [2-3 sentences unpacking the deeper spiritual truth and why Jesus/the author says or does this.]
+### [1. Distinct Sub-Theme Title for First Movement (Verses X–Y)]
+* **The Context:** [1-2 sentences explaining who is speaking, to whom, and important cultural/historical background for verses X–Y.]
+* **What Happens:** [1-2 sentences explaining the exact action, prayer, or dialogue in verses X–Y, quoting key phrases directly from the text above.]
+* **The Meaning:** [2-3 sentences unpacking the deeper spiritual/theological truth of verses X–Y.]
 
-### [2. Second Short Sub-Theme Title (Verses Y–Z)]
-* **The Context:** [1-2 sentences of background or setup.]
-* **What Happens:** [1-2 sentences on the action/response.]
-* **The Meaning:** [2-3 sentences unpacking the heart of the lesson.]
+### [2. Distinct Sub-Theme Title for Second Movement (Verses Y–Z)]
+* **The Context:** [1-2 sentences explaining the shift in focus, audience, or tone in verses Y–Z.]
+* **What Happens:** [1-2 sentences on the specific action, invitation, or response in verses Y–Z, quoting key phrases directly from the text above.]
+* **The Meaning:** [2-3 sentences unpacking the heart of the lesson in verses Y–Z.]
 
 ### Summary
 * **[Key Contrast or Point 1]:** [1 punchy sentence]
@@ -494,13 +556,15 @@ Write a personal, practical guide on how to pray over this chapter and integrate
 """
     return call_groq_safely(prompt)
 
+TRANSLATION_OPTIONS = ["NASB", "ESV", "BSB", "KJV"]
+
 # --- VIEW 1: WELCOME / LANDING SCREEN ---
 if not st.session_state.study_started:
     st.markdown("""
     <div class="vintage-card" style="text-align: center;">
         <div class="vintage-label">WELCOME TO YOUR DEVOTIONAL</div>
         <h2 style="margin-top: 4px; margin-bottom: 10px;">Select Your Reading Place</h2>
-        <p style="margin-bottom: 0;">Choose a Book and Chapter below. Your place will be automatically remembered as you read.</p>
+        <p style="margin-bottom: 0;">Choose your translation, Book, and Chapter below. Your place will be automatically remembered as you read.</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -511,6 +575,9 @@ if not st.session_state.study_started:
             st.rerun()
         st.stop()
 
+    t_idx = TRANSLATION_OPTIONS.index(st.session_state.translation) if st.session_state.translation in TRANSLATION_OPTIONS else 0
+    chosen_trans = st.selectbox("Translation", TRANSLATION_OPTIONS, index=t_idx)
+
     default_book_idx = book_names.index(st.session_state.selected_book_name) if st.session_state.selected_book_name in book_names else 39
     chosen_book_name = st.selectbox("Book", book_names, index=default_book_idx)
     chosen_book_obj = next(b for b in bible_data if b['name'] == chosen_book_name)
@@ -519,25 +586,24 @@ if not st.session_state.study_started:
     default_chap_idx = min(st.session_state.selected_chapter_num - 1, num_chaps - 1)
     chosen_chap_num = st.selectbox("Chapter", range(1, num_chaps + 1), index=max(0, default_chap_idx))
 
-    chap_verses = chosen_book_obj['chapters'][chosen_chap_num - 1]
-    with st.spinner(f"Loading sections for {chosen_book_name} {chosen_chap_num}..."):
+    with st.spinner(f"Loading {chosen_trans} text & sections for {chosen_book_name} {chosen_chap_num}..."):
+        chap_verses = get_chapter_verses(chosen_book_name, chosen_chap_num, chosen_trans)
         preview_sections = get_chapter_sections(chosen_book_name, chosen_chap_num, chap_verses)
 
-    # Verse numbers placed FIRST so they never cut off on mobile screens
     section_labels = [format_dropdown_label(s) for s in preview_sections]
     chosen_sec_label = st.selectbox("Starting Section", section_labels, index=0)
     chosen_sec_idx = section_labels.index(chosen_sec_label)
 
     if st.button("Open Scripture  →", use_container_width=True):
-        save_reading_progress(chosen_book_name, chosen_chap_num, chosen_sec_idx)
+        save_reading_progress(chosen_book_name, chosen_chap_num, chosen_sec_idx, chosen_trans)
         st.rerun()
     st.stop()
 
 # --- VIEW 2: ACTIVE READING VIEW ---
 selected_book_name = st.session_state.selected_book_name
 selected_chapter_num = st.session_state.selected_chapter_num
+current_trans = st.session_state.translation
 selected_book = next(b for b in bible_data if b['name'] == selected_book_name)
-verses = selected_book['chapters'][selected_chapter_num - 1]
 
 if not has_api_key:
     with st.expander("🔑 Enter Groq API Key", expanded=True):
@@ -547,12 +613,16 @@ if not has_api_key:
             st.rerun()
     st.stop()
 
-with st.spinner(f"Preparing thematic sections for {selected_book_name} {selected_chapter_num}..."):
+with st.spinner(f"Preparing {selected_book_name} {selected_chapter_num} ({current_trans})..."):
+    verses = get_chapter_verses(selected_book_name, selected_chapter_num, current_trans)
     sections = get_chapter_sections(selected_book_name, selected_chapter_num, verses)
 total_chunks = len(sections)
 
 # --- TOP PASSAGE & SECTION SELECTOR ---
 with st.expander("📖 Select Book, Chapter & Starting Section", expanded=False):
+    t_idx = TRANSLATION_OPTIONS.index(current_trans) if current_trans in TRANSLATION_OPTIONS else 0
+    new_trans = st.selectbox("Translation", TRANSLATION_OPTIONS, index=t_idx, key="nav_trans")
+
     b_idx = book_names.index(selected_book_name)
     new_book_name = st.selectbox("Book", book_names, index=b_idx, key="nav_book")
     new_book_obj = next(b for b in bible_data if b['name'] == new_book_name)
@@ -562,27 +632,27 @@ with st.expander("📖 Select Book, Chapter & Starting Section", expanded=False)
     c_idx = min(max(0, c_idx), new_num_chapters - 1)
     new_chapter_num = st.selectbox("Chapter", range(1, new_num_chapters + 1), index=c_idx, key="nav_chap")
     
-    nav_verses = new_book_obj['chapters'][new_chapter_num - 1]
+    nav_verses = get_chapter_verses(new_book_name, new_chapter_num, new_trans)
     nav_sections = get_chapter_sections(new_book_name, new_chapter_num, nav_verses)
     nav_section_labels = [format_dropdown_label(s) for s in nav_sections]
     selected_nav_sec = st.selectbox("Start at Section", nav_section_labels, index=0, key="nav_sec")
     selected_nav_sec_idx = nav_section_labels.index(selected_nav_sec)
     
     if st.button("Begin / Jump to Section", use_container_width=True):
-        save_reading_progress(new_book_name, new_chapter_num, selected_nav_sec_idx)
+        save_reading_progress(new_book_name, new_chapter_num, selected_nav_sec_idx, new_trans)
         st.rerun()
 
 # --- CHAPTER SUBHEADER ---
-st.markdown(f"<h2 style='text-align: center; margin-top: 15px; margin-bottom: 20px; font-style: italic;'>{selected_book_name} · Chapter {selected_chapter_num}</h2>", unsafe_allow_html=True)
+st.markdown(f"<h2 style='text-align: center; margin-top: 15px; margin-bottom: 20px; font-style: italic;'>{selected_book_name} · Chapter {selected_chapter_num} <span style='font-size: 1rem; font-style: normal; color: #8C735B;'>({current_trans})</span></h2>", unsafe_allow_html=True)
 
 # --- DISPLAY VINTAGE CARDS & STUDY NOTES ---
 for item in st.session_state.history:
     st.markdown(f"""
     <div class="vintage-card">
-        <div class="vintage-label">SCRIPTURE READING</div>
+        <div class="vintage-label">SCRIPTURE READING · {current_trans}</div>
         <div class="vintage-subheader">{item['title']}</div>
         <div class="vintage-verse-text">{item['html_text']}</div>
-        <div class="vintage-ref">{selected_book_name.upper()} {selected_chapter_num}:{item['range']}</div>
+        <div class="vintage-ref">{selected_book_name.upper()} {selected_chapter_num}:{item['range']} ({current_trans})</div>
     </div>
     """, unsafe_allow_html=True)
     
@@ -599,7 +669,7 @@ if st.session_state.current_chunk < total_chunks:
     current_sec = sections[idx]
     sec_title = current_sec['title']
     start_v = current_sec['start']
-    end_v = current_sec['end']
+    end_v = min(current_sec['end'], len(verses))
     v_range = f"{start_v}–{end_v}" if start_v != end_v else f"{start_v}"
     
     current_verses = verses[start_v - 1 : end_v]
@@ -607,16 +677,16 @@ if st.session_state.current_chunk < total_chunks:
     html_text = " ".join([f"<span class='vintage-verse-num'>{start_v + i}</span>{v}" for i, v in enumerate(current_verses)])
     
     if st.button(f"Read v. {v_range} · {sec_title}  →", use_container_width=True):
-        with st.spinner(f"Unpacking '{sec_title}' (Verses {v_range})..."):
+        with st.spinner(f"Studying {selected_book_name} {selected_chapter_num}:{v_range}..."):
             if st.session_state.history:
-                prev_summary = " | ".join([f"{h['title']} (v. {h['range']}): {h.get('plain_text', '')}" for h in st.session_state.history[-2:]])
+                prev_summary = " | ".join([f"Verses {h['range']}: {h.get('plain_text', '')}" for h in st.session_state.history[-2:]])
             elif start_v > 1:
                 earlier_v = verses[:start_v - 1]
                 prev_summary = "Earlier in this chapter: " + " ".join([f"({i+1}) {v}" for i, v in enumerate(earlier_v[-10:])])
             else:
                 prev_summary = ""
                 
-            insight = get_llama_insight(selected_book_name, selected_chapter_num, sec_title, v_range, plain_text, prev_summary)
+            insight = get_llama_insight(selected_book_name, selected_chapter_num, v_range, plain_text, prev_summary, current_trans)
             
             st.session_state.history.append({
                 "title": sec_title,
@@ -688,13 +758,13 @@ else:
 
     if next_book_name:
         if st.button(f"Continue to {next_book_name} Chapter {next_chap_num}  →", use_container_width=True):
-            save_reading_progress(next_book_name, next_chap_num, 0)
+            save_reading_progress(next_book_name, next_chap_num, 0, current_trans)
             st.rerun()
 
     col1, col2 = st.columns(2)
     with col1:
         if st.button("↺ Restart This Chapter", use_container_width=True):
-            save_reading_progress(selected_book_name, selected_chapter_num, 0)
+            save_reading_progress(selected_book_name, selected_chapter_num, 0, current_trans)
             st.rerun()
     with col2:
         if st.button("📖 Choose Another Passage", use_container_width=True):
