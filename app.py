@@ -43,6 +43,16 @@ strong {
     font-weight: 600;
 }
 
+/* Fix mobile dropdown text truncation so verse numbers & titles are always readable */
+div[data-baseweb="select"] span,
+ul[data-testid="stSelectboxVirtualDropdown"] li {
+    white-space: normal !important;
+    word-wrap: break-word !important;
+    line-height: 1.35 !important;
+    padding-top: 4px !important;
+    padding-bottom: 4px !important;
+}
+
 .vintage-card {
     background: linear-gradient(135deg, #FBF6E9 0%, #F5DEC0 55%, #F2CFAA 100%);
     border-radius: 22px;
@@ -145,8 +155,9 @@ st.markdown("<div class='vintage-label' style='margin-bottom: 4px;'>HEIRLOOM EDI
 st.markdown("<h1 style='text-align: center; font-size: 2.5rem; margin-top: 0; padding-top: 0;'>Scripture & Study</h1>", unsafe_allow_html=True)
 st.markdown("</div>", unsafe_allow_html=True)
 
-# --- LOAD BIBLE DATA ---
+# --- LOAD BIBLE DATA & PERSISTENT SECTION CACHE ---
 BIBLE_FILE = "bible_data.json"
+SECTIONS_CACHE_FILE = "sections_cache.json"
 
 @st.cache_data
 def load_bible():
@@ -161,22 +172,45 @@ def load_bible():
             data = json.load(f)
     return data
 
+def load_persistent_sections():
+    if os.path.exists(SECTIONS_CACHE_FILE):
+        try:
+            with open(SECTIONS_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_persistent_sections(cache_dict):
+    try:
+        with open(SECTIONS_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache_dict, f)
+    except Exception:
+        pass
+
 bible_data = load_bible()
 book_names = [book['name'] for book in bible_data]
 
-# --- API KEY HANDLING ---
-raw_key = st.secrets.get("shanesapi", None)
-api_key = raw_key.strip() if raw_key else st.session_state.get("user_api_key", None)
+# --- API KEY HANDLING (Supports primary 'shanesapi' + optional backup 'shanesapi2') ---
+api_keys = []
+for secret_name in ["shanesapi", "shanesapi2", "backup_api"]:
+    val = st.secrets.get(secret_name, None)
+    if val and val.strip():
+        api_keys.append(val.strip())
+
+if not api_keys and st.session_state.get("user_api_key"):
+    api_keys.append(st.session_state.get("user_api_key"))
+
+has_api_key = len(api_keys) > 0
 
 # --- INITIALIZE SESSION STATE & MEMORY ---
 if "working_model" not in st.session_state:
     st.session_state.working_model = None
 if "sections_cache" not in st.session_state:
-    st.session_state.sections_cache = {}
+    st.session_state.sections_cache = load_persistent_sections()
 if "scroll_to_top" not in st.session_state:
     st.session_state.scroll_to_top = False
 
-# Check URL query params for saved reading spot
 query_book = st.query_params.get("book", None)
 query_chapter = st.query_params.get("chapter", None)
 
@@ -192,7 +226,6 @@ if "study_started" not in st.session_state:
         st.session_state.selected_chapter_num = 1
         st.session_state.study_started = False
 
-        # Try restoring from browser localStorage if returning to bare URL
         components.html("""
         <script>
         const savedBook = localStorage.getItem('heirloom_book');
@@ -215,7 +248,6 @@ if "chapter_summary" not in st.session_state:
 if "prayer_generated" not in st.session_state:
     st.session_state.prayer_generated = False
 
-# Execute smooth scroll-to-top on iPhone when advancing chapters
 if st.session_state.scroll_to_top:
     components.html("""
         <script>
@@ -250,42 +282,44 @@ CRITICAL RULES:
 2. Quote or reference the NASB (New American Standard Bible) wording when discussing the text.
 3. Keep explanations minimalistic, grounded in historical/cultural context, and deeply practical. Do not hallucinate events from other chapters."""
 
+# Cycles through all API keys and models automatically so you never hit a wall
 def call_groq_safely(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.4):
-    client = Groq(api_key=api_key)
-    try:
-        live_models = [m.id for m in client.models.list().data]
-    except Exception:
-        live_models = []
-        
-    llama_first = [m for m in live_models if "llama" in m.lower() and "guard" not in m.lower()]
-    other_chat = [m for m in live_models if m not in llama_first and not any(x in m.lower() for x in ["whisper", "orpheus", "tts", "guard", "embed", "playai"])]
-    everything_else = [m for m in live_models if m not in llama_first and m not in other_chat]
-    
-    candidate_models = llama_first + other_chat + everything_else
-    if st.session_state.working_model:
-        candidate_models = [st.session_state.working_model] + [m for m in candidate_models if m != st.session_state.working_model]
-        
     errors = []
-    for model_id in candidate_models:
+    for key_idx, current_key in enumerate(api_keys):
+        client = Groq(api_key=current_key)
         try:
-            completion = client.chat.completions.create(
-                model=model_id,
-                temperature=temperature,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            content = completion.choices[0].message.content
-            if "<think>" in content and "</think>" in content:
-                content = content.split("</think>")[-1].strip()
-            st.session_state.working_model = model_id
-            return content
-        except Exception as e:
-            errors.append(f"{model_id}: {str(e)}")
-            continue
+            live_models = [m.id for m in client.models.list().data]
+        except Exception:
+            live_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
             
-    st.error("None of the models on your Groq account responded. Models tried: " + " | ".join(errors))
+        llama_first = [m for m in live_models if "llama" in m.lower() and "guard" not in m.lower()]
+        other_chat = [m for m in live_models if m not in llama_first and not any(x in m.lower() for x in ["whisper", "orpheus", "tts", "guard", "embed", "playai"])]
+        everything_else = [m for m in live_models if m not in llama_first and m not in other_chat]
+        
+        candidate_models = llama_first + other_chat + everything_else
+        if st.session_state.working_model:
+            candidate_models = [st.session_state.working_model] + [m for m in candidate_models if m != st.session_state.working_model]
+            
+        for model_id in candidate_models:
+            try:
+                completion = client.chat.completions.create(
+                    model=model_id,
+                    temperature=temperature,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                content = completion.choices[0].message.content
+                if "<think>" in content and "</think>" in content:
+                    content = content.split("</think>")[-1].strip()
+                st.session_state.working_model = model_id
+                return content
+            except Exception as e:
+                errors.append(f"Key{key_idx+1}/{model_id}: {str(e)}")
+                continue
+                
+    st.error("All models/keys exhausted. Details: " + " | ".join(errors[:5]))
     st.stop()
 
 # --- THEMATIC SUBHEADER GENERATOR (PERICOPES) ---
@@ -313,7 +347,7 @@ def enforce_max_chunk_size(sections, max_verses=18):
                 p_end = min(start + (p + 1) * part_size - 1, end)
                 if p_start <= p_end:
                     final_sections.append({
-                        "title": f"{title} (Part {p + 1})",
+                        "title": f"{title} (Pt. {p + 1})",
                         "start": p_start,
                         "end": p_end
                     })
@@ -325,26 +359,20 @@ def get_chapter_sections(book, chapter, verses_list):
         return st.session_state.sections_cache[cache_key]
 
     total_verses = len(verses_list)
-    if not api_key:
+    if not has_api_key:
         return build_fallback_sections(total_verses)
 
     numbered_text = "\n".join([f"{i+1}. {v}" for i, v in enumerate(verses_list)])
-    prompt = f"""Divide {book} Chapter {chapter} (which has {total_verses} verses total, from verse 1 to {total_verses}) into its natural biblical thematic subheaders (pericopes), similar to the section headings found in an NASB or ESV Study Bible.
+    prompt = f"""Divide {book} Chapter {chapter} ({total_verses} verses total, 1 to {total_verses}) into its natural biblical thematic subheaders (pericopes), similar to an NASB Study Bible.
 
 CRITICAL RULES:
-1. Every single verse from 1 to {total_verses} must be covered in sequential order with NO gaps and NO overlaps.
-2. First section MUST start at verse 1. Last section MUST end at verse {total_verses}.
-3. MAXIMUM 18 verses per section. If a thematic section is longer than 18 verses (e.g., 36 verses), split it into smaller consecutive sections of 10-16 verses each (e.g., "The Parable of the Sower (Part 1)" and "The Parable of the Sower (Part 2)").
-4. Return ONLY a valid JSON array of objects with keys "title" (string), "start" (integer), and "end" (integer). No markdown formatting, no explanations.
+1. Cover every verse from 1 to {total_verses} in sequential order with NO gaps and NO overlaps.
+2. Keep each "title" VERY SHORT and punchy (2 to 5 words maximum, e.g., "John's Questions", "Jesus' Tribute to John", "The Parable of the Sower").
+3. MAXIMUM 18 verses per section. If a section is longer than 18 verses, split it into consecutive parts (e.g., "Sermon on the Mount (Pt. 1)").
+4. Return ONLY a valid JSON array of objects with keys "title" (string), "start" (integer), and "end" (integer).
 
 Chapter Text:
-{numbered_text}
-
-Example JSON format:
-[
-  {{"title": "John's Questions", "start": 1, "end": 6}},
-  {{"title": "Jesus' Tribute to John", "start": 7, "end": 19}}
-]"""
+{numbered_text}"""
 
     try:
         raw_resp = call_groq_safely(
@@ -376,6 +404,7 @@ Example JSON format:
                 })
             final_sections = enforce_max_chunk_size(validated, max_verses=18)
             st.session_state.sections_cache[cache_key] = final_sections
+            save_persistent_sections(st.session_state.sections_cache)
             return final_sections
     except Exception:
         pass
@@ -384,6 +413,10 @@ Example JSON format:
     st.session_state.sections_cache[cache_key] = fallback
     return fallback
 
+def format_dropdown_label(sec):
+    v_str = f"v. {sec['start']}–{sec['end']}" if sec['start'] != sec['end'] else f"v. {sec['start']}"
+    return f"{v_str} · {sec['title']}"
+
 # --- DEVOTIONAL ANALYSIS GENERATORS ---
 def get_llama_insight(book, chapter, section_title, verse_range, text, previous_context):
     prompt = f"""
@@ -391,7 +424,7 @@ Passage: {book} {chapter}:{verse_range} ({section_title})
 Text: "{text}"
 Previous context in this chapter: {previous_context if previous_context else "This is the opening section of the chapter."}
 
-Write a clean, theme-driven devotional breakdown of ONLY {book} {chapter}:{verse_range} using this EXACT Markdown template (if the passage is very short, e.g. under 5 verses, you may use just 1 Sub-Theme section; otherwise use 2 Sub-Theme sections):
+Write a clean, theme-driven devotional breakdown of ONLY {book} {chapter}:{verse_range} using this EXACT Markdown template (if the passage is under 5 verses, you may use 1 Sub-Theme section; otherwise use 2 Sub-Theme sections):
 
 ### The Big Picture: [Create a Short, Compelling Theme Title]
 [2-3 clear sentences setting the scene. If this is not the first section, smoothly connect it to what happened right before this. Explain the main tension or big idea of these verses.]
@@ -461,7 +494,7 @@ Write a personal, practical guide on how to pray over this chapter and integrate
 """
     return call_groq_safely(prompt)
 
-# --- VIEW 1: WELCOME / LANDING SCREEN (When no study is active yet) ---
+# --- VIEW 1: WELCOME / LANDING SCREEN ---
 if not st.session_state.study_started:
     st.markdown("""
     <div class="vintage-card" style="text-align: center;">
@@ -471,7 +504,7 @@ if not st.session_state.study_started:
     </div>
     """, unsafe_allow_html=True)
 
-    if not api_key:
+    if not has_api_key:
         input_key = st.text_input("Enter Groq API Key to Begin:", type="password")
         if input_key:
             st.session_state.user_api_key = input_key.strip()
@@ -487,13 +520,11 @@ if not st.session_state.study_started:
     chosen_chap_num = st.selectbox("Chapter", range(1, num_chaps + 1), index=max(0, default_chap_idx))
 
     chap_verses = chosen_book_obj['chapters'][chosen_chap_num - 1]
-    with st.spinner(f"Organizing {chosen_book_name} {chosen_chap_num} into thematic sections..."):
+    with st.spinner(f"Loading sections for {chosen_book_name} {chosen_chap_num}..."):
         preview_sections = get_chapter_sections(chosen_book_name, chosen_chap_num, chap_verses)
 
-    section_labels = [
-        f"{i+1}. {s['title']} (v. {s['start']}–{s['end']})"
-        for i, s in enumerate(preview_sections)
-    ]
+    # Verse numbers placed FIRST so they never cut off on mobile screens
+    section_labels = [format_dropdown_label(s) for s in preview_sections]
     chosen_sec_label = st.selectbox("Starting Section", section_labels, index=0)
     chosen_sec_idx = section_labels.index(chosen_sec_label)
 
@@ -508,7 +539,7 @@ selected_chapter_num = st.session_state.selected_chapter_num
 selected_book = next(b for b in bible_data if b['name'] == selected_book_name)
 verses = selected_book['chapters'][selected_chapter_num - 1]
 
-if not api_key:
+if not has_api_key:
     with st.expander("🔑 Enter Groq API Key", expanded=True):
         input_key = st.text_input("Groq API Key:", type="password")
         if input_key:
@@ -533,10 +564,7 @@ with st.expander("📖 Select Book, Chapter & Starting Section", expanded=False)
     
     nav_verses = new_book_obj['chapters'][new_chapter_num - 1]
     nav_sections = get_chapter_sections(new_book_name, new_chapter_num, nav_verses)
-    nav_section_labels = [
-        f"{i+1}. {s['title']} (v. {s['start']}–{s['end']})"
-        for i, s in enumerate(nav_sections)
-    ]
+    nav_section_labels = [format_dropdown_label(s) for s in nav_sections]
     selected_nav_sec = st.selectbox("Start at Section", nav_section_labels, index=0, key="nav_sec")
     selected_nav_sec_idx = nav_section_labels.index(selected_nav_sec)
     
@@ -578,12 +606,11 @@ if st.session_state.current_chunk < total_chunks:
     plain_text = " ".join([f"({start_v + i}) {v}" for i, v in enumerate(current_verses)])
     html_text = " ".join([f"<span class='vintage-verse-num'>{start_v + i}</span>{v}" for i, v in enumerate(current_verses)])
     
-    if st.button(f"Read: {sec_title} (v. {v_range})  →", use_container_width=True):
+    if st.button(f"Read v. {v_range} · {sec_title}  →", use_container_width=True):
         with st.spinner(f"Unpacking '{sec_title}' (Verses {v_range})..."):
             if st.session_state.history:
                 prev_summary = " | ".join([f"{h['title']} (v. {h['range']}): {h.get('plain_text', '')}" for h in st.session_state.history[-2:]])
             elif start_v > 1:
-                # Provide prior chapter verses for context if user started partway through the chapter
                 earlier_v = verses[:start_v - 1]
                 prev_summary = "Earlier in this chapter: " + " ".join([f"({i+1}) {v}" for i, v in enumerate(earlier_v[-10:])])
             else:
