@@ -338,11 +338,7 @@ def call_groq_safely(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.3):
         "llama-3.3-70b-versatile",
         "qwen/qwen3-32b",
         "deepseek-r1-distill-llama-70b",
-        "llama-3.1-70b-versatile",
-        "meta-llama/llama-4-maverick-17b-128e-instruct",
-        "meta-llama/llama-4-scout-17b-16e-instruct",
-        "gemma2-9b-it",
-        "llama-3.1-8b-instant"
+        "llama-3.1-70b-versatile"
     ]
     errors = []
     for key_idx, current_key in enumerate(api_keys):
