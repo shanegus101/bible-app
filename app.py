@@ -336,9 +336,6 @@ def call_groq_safely(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.3):
     # Strictly prioritize high-reasoning 70B/32B models over small 8B models
     preferred_priority = [
         "llama-3.3-70b-versatile",
-        "qwen/qwen3-32b",
-        "deepseek-r1-distill-llama-70b",
-        "llama-3.1-70b-versatile"
     ]
     errors = []
     for key_idx, current_key in enumerate(api_keys):
