@@ -1,5 +1,4 @@
 import streamlit as st
-import streamlit.components.v1 as components
 import requests
 import json
 import os
@@ -153,9 +152,6 @@ div[data-testid="stExpander"] {
 </style>
 """, unsafe_allow_html=True)
 
-# --- TOP ANCHOR FOR MOBILE AUTO-SCROLL ---
-st.markdown("<div id='top-anchor'></div>", unsafe_allow_html=True)
-
 # --- APP HEADER ---
 st.markdown("<div style='text-align: center; padding-top: 10px;'>", unsafe_allow_html=True)
 st.markdown("<div class='vintage-label' style='margin-bottom: 4px;'>HEIRLOOM EDITION</div>", unsafe_allow_html=True)
@@ -164,11 +160,9 @@ st.markdown("</div>", unsafe_allow_html=True)
 
 # --- LOAD BIBLE STRUCTURE & NASB/ESV TEXT ENGINE ---
 BIBLE_STRUCTURE_FILE = "bible_structure_kjv.json"
-SECTIONS_CACHE_FILE = "sections_cache_v4.json"
+SECTIONS_CACHE_FILE = "sections_cache_v5.json"
 CHAPTER_TEXT_CACHE_FILE = "chapter_text_cache.json"
-
-# Locked exclusively to the best model
-ONLY_MODEL = "llama-3.3-70b-versatile"
+LAST_STATE_FILE = "last_reading_spot.json"
 
 @st.cache_data
 def load_bible_structure():
@@ -216,7 +210,6 @@ def get_chapter_verses(book_name, chapter_num, translation="NASB"):
     cache_key = f"{translation}_{book_name}_{chapter_num}"
     if cache_key in st.session_state.chapter_text_cache:
         cached = st.session_state.chapter_text_cache[cache_key]
-        # Clean any legacy unstripped HTML tags if present
         return [clean_verse_html(v) for v in cached]
 
     book_idx = book_names.index(book_name) + 1
@@ -248,16 +241,19 @@ if not api_keys and st.session_state.get("user_api_key"):
 
 has_api_key = len(api_keys) > 0
 
-# --- INITIALIZE SESSION STATE & MEMORY ---
+# --- INITIALIZE SESSION STATE & PERSISTENT MEMORY ---
 if "sections_cache" not in st.session_state:
     st.session_state.sections_cache = load_json_cache(SECTIONS_CACHE_FILE)
-if "scroll_to_top" not in st.session_state:
-    st.session_state.scroll_to_top = False
-if "translation" not in st.session_state:
-    st.session_state.translation = st.query_params.get("trans", "NASB")
+if "best_model" not in st.session_state:
+    st.session_state.best_model = None
 
+saved_spot = load_json_cache(LAST_STATE_FILE)
 query_book = st.query_params.get("book", None)
 query_chapter = st.query_params.get("chapter", None)
+query_trans = st.query_params.get("trans", None)
+
+if "translation" not in st.session_state:
+    st.session_state.translation = query_trans or saved_spot.get("trans", "NASB")
 
 if "study_started" not in st.session_state:
     if query_book in book_names and query_chapter and query_chapter.isdigit():
@@ -266,23 +262,14 @@ if "study_started" not in st.session_state:
         st.session_state.selected_book_name = query_book
         st.session_state.selected_chapter_num = c_num
         st.session_state.study_started = True
+    elif saved_spot.get("book") in book_names and saved_spot.get("chapter"):
+        st.session_state.selected_book_name = saved_spot["book"]
+        st.session_state.selected_chapter_num = int(saved_spot["chapter"])
+        st.session_state.study_started = False  # Pre-fills their last book/chapter on the Welcome Card
     else:
         st.session_state.selected_book_name = "Matthew"
         st.session_state.selected_chapter_num = 1
         st.session_state.study_started = False
-
-        components.html("""
-        <script>
-        const savedBook = localStorage.getItem('heirloom_book');
-        const savedChap = localStorage.getItem('heirloom_chapter');
-        const urlParams = new URLSearchParams(window.parent.location.search);
-        if (savedBook && savedChap && !urlParams.get('book')) {
-            urlParams.set('book', savedBook);
-            urlParams.set('chapter', savedChap);
-            window.parent.location.search = urlParams.toString();
-        }
-        </script>
-        """, height=0)
 
 if "current_chunk" not in st.session_state:
     st.session_state.current_chunk = 0
@@ -293,15 +280,6 @@ if "chapter_summary" not in st.session_state:
 if "prayer_generated" not in st.session_state:
     st.session_state.prayer_generated = False
 
-if st.session_state.scroll_to_top:
-    components.html("""
-        <script>
-            window.parent.document.getElementById('top-anchor').scrollIntoView({behavior: 'smooth'});
-            window.parent.scrollTo({top: 0, behavior: 'smooth'});
-        </script>
-    """, height=0)
-    st.session_state.scroll_to_top = False
-
 def save_reading_progress(book, chapter, start_section_idx=0, translation="NASB"):
     st.session_state.selected_book_name = book
     st.session_state.selected_chapter_num = chapter
@@ -311,18 +289,58 @@ def save_reading_progress(book, chapter, start_section_idx=0, translation="NASB"
     st.session_state.chapter_summary = None
     st.session_state.prayer_generated = False
     st.session_state.study_started = True
-    st.session_state.scroll_to_top = True
     st.query_params["book"] = book
     st.query_params["chapter"] = str(chapter)
     st.query_params["trans"] = translation
-    components.html(f"""
-        <script>
-            localStorage.setItem('heirloom_book', "{book}");
-            localStorage.setItem('heirloom_chapter', "{chapter}");
-        </script>
-    """, height=0)
+    save_json_cache(LAST_STATE_FILE, {"book": book, "chapter": chapter, "trans": translation})
 
-# --- STRICT SINGLE-MODEL ROUTER WITH AUTOMATIC RETRY ---
+# --- AUTO-SELECT & LOCK IN THE #1 FLAGSHIP MODEL ON YOUR GROQ ACCOUNT ---
+def get_single_best_model(client):
+    """Finds the single best flagship instruct model active on your Groq account and locks it in."""
+    if st.session_state.best_model:
+        return st.session_state.best_model
+
+    try:
+        live_ids = [m.id for m in client.models.list().data]
+    except Exception:
+        live_ids = []
+
+    # Ranked from highest-capability non-thinking instruct models down
+    flagship_ranking = [
+        "meta-llama/llama-4-maverick-17b-128e-instruct",
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "moonshotai/kimi-k2-instruct-0905",
+        "moonshotai/kimi-k2-instruct",
+        "llama-3.3-70b-versatile",
+        "llama-3.1-70b-versatile",
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
+        "qwen/qwen3-32b",
+        "llama-3.1-8b-instant"
+    ]
+
+    for candidate in flagship_ranking:
+        if candidate in live_ids:
+            st.session_state.best_model = candidate
+            return candidate
+
+    # If Groq renamed models, pick the largest active Llama/Kimi/GPT instruct model
+    chat_models = [
+        m for m in live_ids
+        if not any(x in m.lower() for x in ["whisper", "orpheus", "tts", "guard", "embed", "playai", "vision"])
+    ]
+    for m in chat_models:
+        if any(k in m.lower() for k in ["maverick", "70b", "120b", "kimi", "scout", "llama"]):
+            st.session_state.best_model = m
+            return m
+
+    if chat_models:
+        st.session_state.best_model = chat_models[0]
+        return chat_models[0]
+
+    return "meta-llama/llama-4-scout-17b-16e-instruct"
+
+# --- STRICT DEVOTIONAL PROMPTS & SINGLE-MODEL EXECUTION ---
 SYSTEM_PROMPT = """You are an insightful, warm, and theologically precise Bible study teacher writing a clean devotional guide.
 CRITICAL RULES:
 1. NEVER include conversational filler like "Sure, let's break down..." or "Here is the analysis".
@@ -333,27 +351,30 @@ CRITICAL RULES:
 def strip_hidden_tags(text):
     if not text:
         return ""
-    # Remove closed <verify>...</verify> or <think>...</think> blocks
+    # Strip closed <think>...</think> and <verify>...</verify> blocks
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
     text = re.sub(r'<verify>.*?</verify>', '', text, flags=re.DOTALL)
-    # Also handle any unclosed <verify> tag if the model forgot the closing slash before `### The Big Picture`
-    if "<verify>" in text and "### The Big Picture" in text:
-        text = "### The Big Picture" + text.split("### The Big Picture", 1)[1]
+    # If an unclosed <think> or <verify> tag exists before the markdown heading, slice cleanly from `###`
+    if ("<think>" in text or "<verify>" in text) and "###" in text:
+        text = "###" + text.split("###", 1)[1]
+    elif "<think>" in text:
+        text = text.split("</think>")[-1]
     text = re.sub(r'^```(?:markdown|json)?\s*', '', text.strip())
     text = re.sub(r'\s*```$', '', text.strip())
     return text.strip()
 
-def call_groq_safely(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.25, max_attempts=6):
-    """Exclusively runs llama-3.3-70b-versatile. Automatically waits and retries on rate limits or blank outputs."""
+def call_groq_safely(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.25, max_attempts=5):
+    """Runs ONLY your account's #1 flagship model. Retries automatically on rate limits or incomplete outputs."""
     last_error = ""
     for attempt in range(max_attempts):
         for current_key in api_keys:
             client = Groq(api_key=current_key)
+            target_model = get_single_best_model(client)
             try:
                 completion = client.chat.completions.create(
-                    model=ONLY_MODEL,
+                    model=target_model,
                     temperature=temperature,
-                    max_tokens=2048,
+                    max_tokens=4096,
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": prompt}
@@ -361,22 +382,25 @@ def call_groq_safely(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.25, max_
                 )
                 raw_content = completion.choices[0].message.content or ""
                 cleaned = strip_hidden_tags(raw_content)
-                if len(cleaned) > 20:
+                if len(cleaned) > 15:
                     return cleaned
                 else:
-                    last_error = "Model returned an empty response."
+                    last_error = f"Empty response from {target_model}"
             except Exception as e:
                 last_error = str(e)
-                # If rate-limited (429), pause briefly and retry automatically
+                # If the cached model was deprecated (404), clear it so get_single_best_model refreshes immediately
+                if "404" in last_error or "model_not_found" in last_error or "decommissioned" in last_error:
+                    st.session_state.best_model = None
+                    continue
+                # If rate-limited (429), wait the exact requested seconds and retry
                 wait_match = re.search(r'try again in ([0-9.]+)s', last_error)
                 if wait_match:
-                    wait_sec = min(float(wait_match.group(1)) + 0.5, 8.0)
-                    time.sleep(wait_sec)
+                    time.sleep(min(float(wait_match.group(1)) + 0.5, 7.0))
                 else:
-                    time.sleep(1.5 * (attempt + 1))
+                    time.sleep(1.2 * (attempt + 1))
                 continue
 
-    st.error(f"Could not reach {ONLY_MODEL} after {max_attempts} attempts. Last error: {last_error}")
+    st.error(f"Groq API error after {max_attempts} attempts: {last_error}")
     st.stop()
 
 # --- THEMATIC SUBHEADER GENERATOR (NO "VERSES 1-15" FALLBACK; RETRIES UNTIL SUCCESS) ---
@@ -404,7 +428,6 @@ def enforce_max_chunk_size(sections, max_verses=18):
     return final_sections
 
 def is_generic_fallback(sections_list):
-    """Detects if a cached section list contains generic 'Verses X-Y' titles so we can regenerate it."""
     if not sections_list:
         return True
     for s in sections_list:
@@ -429,7 +452,7 @@ CRITICAL RULES:
 2. First section MUST start at 1. Last section MUST end at {total_verses}.
 3. Every "title" MUST be a real thematic biblical heading (2 to 4 words, under 24 characters! Examples: "John's Questions", "Tribute to John", "Woes to Cities", "Come to Me", "Lord of the Sabbath"). NEVER use verse numbers like "Verses 1-15" as a title!
 4. A typical chapter should have 3 to 6 natural pericopes (each 4 to 16 verses long).
-5. Return ONLY a valid JSON array of objects with keys "title" (string), "start" (integer), and "end" (integer).
+5. Return ONLY a valid JSON array of objects with keys "title" (string), "start" (integer), and "end" (integer). Do not include any other text.
 
 Example format:
 [
@@ -440,7 +463,6 @@ Example format:
 Chapter Text:
 {numbered_text}"""
 
-    # Retry loop: keeps prompting llama-3.3-70b-versatile until valid thematic subheaders are returned
     for attempt in range(5):
         raw_resp = call_groq_safely(
             prompt,
@@ -457,7 +479,6 @@ Chapter Text:
                 expected_start = 1
                 for item in parsed:
                     t = str(item.get("title", "")).strip()
-                    # Reject generic "Verses X-Y" titles
                     if not t or re.match(r'^Verses\s+\d+', t, re.IGNORECASE):
                         raise ValueError("Generic title returned")
                     e = int(item.get("end", expected_start))
@@ -471,7 +492,6 @@ Chapter Text:
                         break
                 
                 if validated and expected_start <= total_verses:
-                    # Extend the final section to cover any trailing verses cleanly
                     validated[-1]["end"] = total_verses
                 
                 if validated:
@@ -480,17 +500,17 @@ Chapter Text:
                     save_json_cache(SECTIONS_CACHE_FILE, st.session_state.sections_cache)
                     return final_sections
         except Exception:
-            time.sleep(1.0)
+            time.sleep(0.8)
             continue
 
-    st.error(f"Failed to generate thematic section headers for {book} {chapter}. Please tap 'Open Scripture' or retry.")
+    st.error(f"Could not format thematic sections for {book} {chapter}. Please tap retry.")
     st.stop()
 
 def format_dropdown_label(sec):
     v_str = f"v. {sec['start']}–{sec['end']}" if sec['start'] != sec['end'] else f"v. {sec['start']}"
     return f"{v_str} · {sec['title']}"
 
-# --- SELF-VERIFYING DEVOTIONAL ENGINE (WITH NON-EMPTY & FORMAT VALIDATION LOOP) ---
+# --- SELF-VERIFYING DEVOTIONAL ENGINE (GUARANTEED NON-EMPTY) ---
 def get_llama_insight(book, chapter, start_v, end_v, text, previous_context, translation="NASB"):
     v_range = f"{start_v}–{end_v}" if start_v != end_v else f"{start_v}"
     num_verses = end_v - start_v + 1
@@ -529,13 +549,12 @@ Passage: {book} {chapter}:{v_range} ({translation} Translation)
 Exact Verse Text: "{text}"
 Previous context in this chapter: {previous_context if previous_context else "This is the opening section of the chapter."}
 
-STEP 1 — SILENT VERIFICATION (Write inside `<verify>...</verify>` tags first):
-1. Identify the exact verse split so Part 1 and Part 2 cover TWO DIFFERENT, NON-OVERLAPPING sequential verse ranges (e.g., Part 1 = Verses {part1_hint}, Part 2 = Verses {part2_hint}). NEVER use `({v_range})` on both Part 1 and Part 2!
-2. Verify WHO is speaking and TO WHOM in Part 1 vs. Part 2 (e.g., praying to the Father vs. answering Pharisees vs. healing a man).
-3. Verify that every quote you plan to use is actually inside the Exact Verse Text above (do NOT import quotes from Mark, Luke, or other chapters!).
+CRITICAL RULES BEFORE WRITING:
+1. Divide {book} {chapter}:{v_range} into TWO sequential, NON-OVERLAPPING verse ranges (e.g., Part 1 = Verses {part1_hint} and Part 2 = Verses {part2_hint}, or wherever the natural shift in speaker/action occurs). NEVER put `({v_range})` on both Part 1 and Part 2!
+2. Identify WHO is speaking and TO WHOM in Part 1 vs. Part 2 (e.g., praying to the Father vs. answering Pharisees vs. healing a man).
+3. Quote ONLY from the Exact Verse Text above (do NOT import quotes from Mark, Luke, or other chapters!).
 
-STEP 2 — DEVOTIONAL BREAKDOWN (Write immediately after `</verify>`):
-Using your verification, write the devotional breakdown using this EXACT Markdown template:
+Write the devotional breakdown using this EXACT Markdown template (start IMMEDIATELY with `### The Big Picture:`):
 
 ### The Big Picture: [Create a Short, Compelling Theme Title]
 [2-3 clear sentences setting the scene. If this is not the first section, smoothly connect it to what happened right before this. Explain the main tension or big idea of these verses.]
@@ -557,12 +576,11 @@ Using your verification, write the devotional breakdown using this EXACT Markdow
 **Ultimately:** [1 final, memorable sentence summarizing what {book} {chapter}:{v_range} teaches us about following God.]
 """
 
-    # Retry loop guarantees the returned insight is NEVER blank and always contains the study notes
     for attempt in range(4):
         result = call_groq_safely(prompt, temperature=0.25 + (attempt * 0.05))
-        if result and "### The Big Picture" in result and "What Happens" in result and len(result.strip()) > 150:
+        if result and "###" in result and "What Happens" in result and len(result.strip()) > 150:
             return result
-        time.sleep(1.0)
+        time.sleep(0.8)
 
     return call_groq_safely(prompt, temperature=0.3)
 
@@ -677,6 +695,9 @@ total_chunks = len(sections)
 
 # --- TOP PASSAGE & SECTION SELECTOR ---
 with st.expander("📖 Select Book, Chapter & Starting Section", expanded=False):
+    if st.session_state.best_model:
+        st.caption(f"Active Flagship Model: `{st.session_state.best_model}`")
+
     t_idx = TRANSLATION_OPTIONS.index(current_trans) if current_trans in TRANSLATION_OPTIONS else 0
     new_trans = st.selectbox("Translation", TRANSLATION_OPTIONS, index=t_idx, key="nav_trans")
 
@@ -834,6 +855,5 @@ else:
     with col2:
         if st.button("📖 Choose Another Passage", use_container_width=True):
             st.session_state.study_started = False
-            st.session_state.scroll_to_top = True
             st.query_params.clear()
             st.rerun()
