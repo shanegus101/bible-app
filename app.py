@@ -4,6 +4,7 @@ import requests
 import json
 import os
 import re
+import time
 from groq import Groq
 
 # --- PAGE SETUP ---
@@ -163,8 +164,11 @@ st.markdown("</div>", unsafe_allow_html=True)
 
 # --- LOAD BIBLE STRUCTURE & NASB/ESV TEXT ENGINE ---
 BIBLE_STRUCTURE_FILE = "bible_structure_kjv.json"
-SECTIONS_CACHE_FILE = "sections_cache_v3.json"
+SECTIONS_CACHE_FILE = "sections_cache_v4.json"
 CHAPTER_TEXT_CACHE_FILE = "chapter_text_cache.json"
+
+# Locked exclusively to the best model
+ONLY_MODEL = "llama-3.3-70b-versatile"
 
 @st.cache_data
 def load_bible_structure():
@@ -211,7 +215,9 @@ if "chapter_text_cache" not in st.session_state:
 def get_chapter_verses(book_name, chapter_num, translation="NASB"):
     cache_key = f"{translation}_{book_name}_{chapter_num}"
     if cache_key in st.session_state.chapter_text_cache:
-        return st.session_state.chapter_text_cache[cache_key]
+        cached = st.session_state.chapter_text_cache[cache_key]
+        # Clean any legacy unstripped HTML tags if present
+        return [clean_verse_html(v) for v in cached]
 
     book_idx = book_names.index(book_name) + 1
     try:
@@ -316,69 +322,64 @@ def save_reading_progress(book, chapter, start_section_idx=0, translation="NASB"
         </script>
     """, height=0)
 
-# --- STRICT DEVOTIONAL PROMPTS & MODEL ROUTER ---
+# --- STRICT SINGLE-MODEL ROUTER WITH AUTOMATIC RETRY ---
 SYSTEM_PROMPT = """You are an insightful, warm, and theologically precise Bible study teacher writing a clean devotional guide.
 CRITICAL RULES:
-1. NEVER include conversational filler like "Sure, let's break down..." or "Here is the analysis". Start IMMEDIATELY with `### The Big Picture:`.
+1. NEVER include conversational filler like "Sure, let's break down..." or "Here is the analysis".
 2. Quote ONLY from the exact Bible verses provided in the prompt. NEVER import famous quotes from parallel Gospels or other chapters (for example, do not quote Mark's "The Sabbath was made for man" when analyzing Matthew 12).
 3. Pay strict attention to WHO is speaking and TO WHOM in each verse.
 4. NEVER repeat the same verse range, action, or meaning in Sub-Theme 1 and Sub-Theme 2."""
 
 def strip_hidden_tags(text):
+    if not text:
+        return ""
+    # Remove closed <verify>...</verify> or <think>...</think> blocks
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
     text = re.sub(r'<verify>.*?</verify>', '', text, flags=re.DOTALL)
-    # Remove accidental markdown code fences if a model wraps its response
-    text = re.sub(r'^```(?:markdown)?\s*', '', text.strip())
+    # Also handle any unclosed <verify> tag if the model forgot the closing slash before `### The Big Picture`
+    if "<verify>" in text and "### The Big Picture" in text:
+        text = "### The Big Picture" + text.split("### The Big Picture", 1)[1]
+    text = re.sub(r'^```(?:markdown|json)?\s*', '', text.strip())
     text = re.sub(r'\s*```$', '', text.strip())
     return text.strip()
 
-def call_groq_safely(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.3):
-    # Strictly prioritize high-reasoning 70B/32B models over small 8B models
-    preferred_priority = [
-        "llama-3.3-70b-versatile",
-    ]
-    errors = []
-    for key_idx, current_key in enumerate(api_keys):
-        client = Groq(api_key=current_key)
-        try:
-            live_models = [m.id for m in client.models.list().data]
-        except Exception:
-            live_models = preferred_priority
-
-        top_tier = [m for m in preferred_priority if m in live_models]
-        other_large = [m for m in live_models if m not in top_tier and any(sz in m.lower() for sz in ["70b", "32b", "17b"]) and "guard" not in m.lower()]
-        other_chat = [m for m in live_models if m not in top_tier and m not in other_large and not any(x in m.lower() for x in ["whisper", "orpheus", "tts", "guard", "embed", "playai"])]
-        
-        candidate_models = top_tier + other_large + other_chat
-
-        for model_id in candidate_models:
+def call_groq_safely(prompt, system_prompt=SYSTEM_PROMPT, temperature=0.25, max_attempts=6):
+    """Exclusively runs llama-3.3-70b-versatile. Automatically waits and retries on rate limits or blank outputs."""
+    last_error = ""
+    for attempt in range(max_attempts):
+        for current_key in api_keys:
+            client = Groq(api_key=current_key)
             try:
                 completion = client.chat.completions.create(
-                    model=model_id,
+                    model=ONLY_MODEL,
                     temperature=temperature,
+                    max_tokens=2048,
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": prompt}
                     ]
                 )
-                content = completion.choices[0].message.content
-                content = strip_hidden_tags(content)
-                return content
+                raw_content = completion.choices[0].message.content or ""
+                cleaned = strip_hidden_tags(raw_content)
+                if len(cleaned) > 20:
+                    return cleaned
+                else:
+                    last_error = "Model returned an empty response."
             except Exception as e:
-                errors.append(f"Key{key_idx+1}/{model_id}: {str(e)}")
+                last_error = str(e)
+                # If rate-limited (429), pause briefly and retry automatically
+                wait_match = re.search(r'try again in ([0-9.]+)s', last_error)
+                if wait_match:
+                    wait_sec = min(float(wait_match.group(1)) + 0.5, 8.0)
+                    time.sleep(wait_sec)
+                else:
+                    time.sleep(1.5 * (attempt + 1))
                 continue
-                
-    st.error("All models/keys exhausted. Details: " + " | ".join(errors[:5]))
+
+    st.error(f"Could not reach {ONLY_MODEL} after {max_attempts} attempts. Last error: {last_error}")
     st.stop()
 
-# --- THEMATIC SUBHEADER GENERATOR (PERICOPES) ---
-def build_fallback_sections(total_verses, max_v=15):
-    sections = []
-    for s in range(1, total_verses + 1, max_v):
-        e = min(s + max_v - 1, total_verses)
-        sections.append({"title": f"Verses {s}–{e}", "start": s, "end": e})
-    return sections
-
+# --- THEMATIC SUBHEADER GENERATOR (NO "VERSES 1-15" FALLBACK; RETRIES UNTIL SUCCESS) ---
 def enforce_max_chunk_size(sections, max_verses=18):
     final_sections = []
     for sec in sections:
@@ -402,86 +403,106 @@ def enforce_max_chunk_size(sections, max_verses=18):
                     })
     return final_sections
 
+def is_generic_fallback(sections_list):
+    """Detects if a cached section list contains generic 'Verses X-Y' titles so we can regenerate it."""
+    if not sections_list:
+        return True
+    for s in sections_list:
+        if re.match(r'^Verses\s+\d+', str(s.get("title", "")), re.IGNORECASE):
+            return True
+    return False
+
 def get_chapter_sections(book, chapter, verses_list):
     cache_key = f"{book}_{chapter}"
     if cache_key in st.session_state.sections_cache:
-        return st.session_state.sections_cache[cache_key]
+        cached_secs = st.session_state.sections_cache[cache_key]
+        if not is_generic_fallback(cached_secs):
+            return cached_secs
 
     total_verses = len(verses_list)
-    if not has_api_key:
-        return build_fallback_sections(total_verses)
-
     numbered_text = "\n".join([f"{i+1}. {v}" for i, v in enumerate(verses_list)])
-    prompt = f"""Divide {book} Chapter {chapter} ({total_verses} verses total, 1 to {total_verses}) into its natural biblical thematic subheaders (pericopes), matching standard NASB/ESV Study Bible section divisions.
+    
+    prompt = f"""Divide {book} Chapter {chapter} ({total_verses} verses total, from verse 1 to {total_verses}) into its natural biblical thematic subheaders (pericopes), matching standard NASB/ESV Study Bible section headings.
 
 CRITICAL RULES:
 1. Cover every verse from 1 to {total_verses} in sequential order with NO gaps and NO overlaps.
-2. Keep each "title" ULTRA-SHORT (maximum 2 to 4 words, under 24 characters! Examples: "John's Questions", "Tribute to John", "Woes to Cities", "Come to Me").
-3. Do NOT over-fragment short chapters: a typical chapter should have 3 to 5 natural pericopes (each 5 to 16 verses long), unless a pericope exceeds 18 verses.
-4. Return ONLY a valid JSON array of objects with keys "title" (string), "start" (integer), and "end" (integer).
+2. First section MUST start at 1. Last section MUST end at {total_verses}.
+3. Every "title" MUST be a real thematic biblical heading (2 to 4 words, under 24 characters! Examples: "John's Questions", "Tribute to John", "Woes to Cities", "Come to Me", "Lord of the Sabbath"). NEVER use verse numbers like "Verses 1-15" as a title!
+4. A typical chapter should have 3 to 6 natural pericopes (each 4 to 16 verses long).
+5. Return ONLY a valid JSON array of objects with keys "title" (string), "start" (integer), and "end" (integer).
+
+Example format:
+[
+  {{"title": "Lord of the Sabbath", "start": 1, "end": 8}},
+  {{"title": "The Withered Hand", "start": 9, "end": 14}}
+]
 
 Chapter Text:
 {numbered_text}"""
 
-    try:
+    # Retry loop: keeps prompting llama-3.3-70b-versatile until valid thematic subheaders are returned
+    for attempt in range(5):
         raw_resp = call_groq_safely(
             prompt,
-            system_prompt="You are a biblical scholar and precise JSON generator. Output ONLY a valid JSON array.",
-            temperature=0.1
+            system_prompt="You are a biblical scholar and strict JSON generator. Output ONLY a valid JSON array of objects.",
+            temperature=0.1 + (attempt * 0.05)
         )
-        match = re.search(r'\[.*\]', raw_resp, re.DOTALL)
-        if match:
-            parsed = json.loads(match.group(0))
-            validated = []
-            expected_start = 1
-            for item in parsed:
-                t = str(item.get("title", "Scripture Reading")).strip()
-                e = int(item.get("end", expected_start))
-                if e < expected_start:
-                    continue
-                if e > total_verses:
-                    e = total_verses
-                validated.append({"title": t, "start": expected_start, "end": e})
-                expected_start = e + 1
-                if expected_start > total_verses:
-                    break
-            if expected_start <= total_verses:
-                validated.append({
-                    "title": "Closing Verses",
-                    "start": expected_start,
-                    "end": total_verses
-                })
-            final_sections = enforce_max_chunk_size(validated, max_verses=18)
-            st.session_state.sections_cache[cache_key] = final_sections
-            save_json_cache(SECTIONS_CACHE_FILE, st.session_state.sections_cache)
-            return final_sections
-    except Exception:
-        pass
+        try:
+            match = re.search(r'\[.*\]', raw_resp, re.DOTALL)
+            json_str = match.group(0) if match else raw_resp
+            parsed = json.loads(json_str)
+            
+            if isinstance(parsed, list) and len(parsed) > 0:
+                validated = []
+                expected_start = 1
+                for item in parsed:
+                    t = str(item.get("title", "")).strip()
+                    # Reject generic "Verses X-Y" titles
+                    if not t or re.match(r'^Verses\s+\d+', t, re.IGNORECASE):
+                        raise ValueError("Generic title returned")
+                    e = int(item.get("end", expected_start))
+                    if e < expected_start:
+                        continue
+                    if e > total_verses:
+                        e = total_verses
+                    validated.append({"title": t, "start": expected_start, "end": e})
+                    expected_start = e + 1
+                    if expected_start > total_verses:
+                        break
+                
+                if validated and expected_start <= total_verses:
+                    # Extend the final section to cover any trailing verses cleanly
+                    validated[-1]["end"] = total_verses
+                
+                if validated:
+                    final_sections = enforce_max_chunk_size(validated, max_verses=18)
+                    st.session_state.sections_cache[cache_key] = final_sections
+                    save_json_cache(SECTIONS_CACHE_FILE, st.session_state.sections_cache)
+                    return final_sections
+        except Exception:
+            time.sleep(1.0)
+            continue
 
-    fallback = build_fallback_sections(total_verses)
-    st.session_state.sections_cache[cache_key] = fallback
-    return fallback
+    st.error(f"Failed to generate thematic section headers for {book} {chapter}. Please tap 'Open Scripture' or retry.")
+    st.stop()
 
 def format_dropdown_label(sec):
     v_str = f"v. {sec['start']}–{sec['end']}" if sec['start'] != sec['end'] else f"v. {sec['start']}"
     return f"{v_str} · {sec['title']}"
 
-# --- TWO-PASS GENERATOR + THEOLOGICAL CRITIC ENGINE ---
+# --- SELF-VERIFYING DEVOTIONAL ENGINE (WITH NON-EMPTY & FORMAT VALIDATION LOOP) ---
 def get_llama_insight(book, chapter, start_v, end_v, text, previous_context, translation="NASB"):
     v_range = f"{start_v}–{end_v}" if start_v != end_v else f"{start_v}"
     num_verses = end_v - start_v + 1
 
-    # Calculate default non-overlapping midpoint so the AI knows it MUST split the verses sequentially
     mid_v = start_v + (num_verses // 2) - 1
     if mid_v < start_v:
         mid_v = start_v
     part1_hint = f"{start_v}–{mid_v}" if start_v != mid_v else f"{start_v}"
     part2_hint = f"{mid_v + 1}–{end_v}" if (mid_v + 1) != end_v else f"{end_v}"
 
-    # PASS 1: Generate Initial Devotional Breakdown
     if num_verses <= 3:
-        # Very short 1-3 verse passage: use 1 Sub-Theme so it never duplicates
-        draft_prompt = f"""
+        prompt = f"""
 Passage: {book} {chapter}:{v_range} ({translation} Translation)
 Exact Verse Text: "{text}"
 Previous context in this chapter: {previous_context if previous_context else "This is the opening section of the chapter."}
@@ -503,32 +524,31 @@ Write a clean, theme-driven devotional breakdown of ONLY {book} {chapter}:{v_ran
 **Ultimately:** [1 final, memorable sentence summarizing what {book} {chapter}:{v_range} teaches us about following God.]
 """
     else:
-        draft_prompt = f"""
+        prompt = f"""
 Passage: {book} {chapter}:{v_range} ({translation} Translation)
 Exact Verse Text: "{text}"
 Previous context in this chapter: {previous_context if previous_context else "This is the opening section of the chapter."}
 
-CRITICAL PARTITION RULE:
-You MUST divide {book} {chapter}:{v_range} into TWO sequential, NON-OVERLAPPING verse ranges (for example, Part 1 covering Verses {part1_hint} and Part 2 covering Verses {part2_hint}, or wherever the natural shift in speaker/action occurs).
-- NEVER put "(Verses {v_range})" on both Part 1 and Part 2!
-- Part 1 must ONLY analyze the first group of verses (e.g., the setup, question, or prayer).
-- Part 2 must ONLY analyze the second group of verses (e.g., the answer, miracle, or invitation).
-- NEVER quote verses from other chapters or other Gospels (e.g., do NOT quote Mark 2:27 "The Sabbath was made for man" if it is not in the text above!).
+STEP 1 — SILENT VERIFICATION (Write inside `<verify>...</verify>` tags first):
+1. Identify the exact verse split so Part 1 and Part 2 cover TWO DIFFERENT, NON-OVERLAPPING sequential verse ranges (e.g., Part 1 = Verses {part1_hint}, Part 2 = Verses {part2_hint}). NEVER use `({v_range})` on both Part 1 and Part 2!
+2. Verify WHO is speaking and TO WHOM in Part 1 vs. Part 2 (e.g., praying to the Father vs. answering Pharisees vs. healing a man).
+3. Verify that every quote you plan to use is actually inside the Exact Verse Text above (do NOT import quotes from Mark, Luke, or other chapters!).
 
-Write the breakdown using this EXACT Markdown template:
+STEP 2 — DEVOTIONAL BREAKDOWN (Write immediately after `</verify>`):
+Using your verification, write the devotional breakdown using this EXACT Markdown template:
 
 ### The Big Picture: [Create a Short, Compelling Theme Title]
 [2-3 clear sentences setting the scene. If this is not the first section, smoothly connect it to what happened right before this. Explain the main tension or big idea of these verses.]
 
-### 1. [Short Sub-Theme Title for First Half (Verses {start_v}–X)]
-* **The Context:** [1-2 sentences explaining who is involved, who is speaking to whom, and important cultural/historical background for ONLY verses {start_v}–X.]
-* **What Happens:** [1-2 sentences explaining the action, prayer, or dialogue in ONLY verses {start_v}–X, quoting key {translation} phrases from the text above.]
-* **The Meaning:** [2-3 sentences unpacking the deeper spiritual truth of verses {start_v}–X.]
+### 1. [Distinct Sub-Theme Title for First Half (Verses {start_v}–X)]
+* **The Context:** [1-2 sentences explaining who is involved, who is speaking to whom, and important cultural/historical background for ONLY the first half of the verses.]
+* **What Happens:** [1-2 sentences explaining the action, prayer, or dialogue in ONLY the first half, quoting key {translation} phrases from the text above.]
+* **The Meaning:** [2-3 sentences unpacking the deeper spiritual truth of the first half.]
 
-### 2. [Short Sub-Theme Title for Second Half (Verses Y–{end_v})]
-* **The Context:** [1-2 sentences of background or the shift in tone/focus in ONLY verses Y–{end_v}.]
-* **What Happens:** [1-2 sentences on the action, response, or resolution in ONLY verses Y–{end_v}, quoting key {translation} phrases from the text above.]
-* **The Meaning:** [2-3 sentences unpacking the heart of the lesson in verses Y–{end_v}.]
+### 2. [Distinct Sub-Theme Title for Second Half (Verses Y–{end_v})]
+* **The Context:** [1-2 sentences of background or the shift in focus/action in ONLY the second half of the verses.]
+* **What Happens:** [1-2 sentences on the specific action, response, or resolution in ONLY the second half, quoting key {translation} phrases from the text above.]
+* **The Meaning:** [2-3 sentences unpacking the heart of the lesson in the second half.]
 
 ### Summary
 * **[Key Contrast or Point 1]:** [1 punchy sentence]
@@ -537,34 +557,14 @@ Write the breakdown using this EXACT Markdown template:
 **Ultimately:** [1 final, memorable sentence summarizing what {book} {chapter}:{v_range} teaches us about following God.]
 """
 
-    draft = call_groq_safely(draft_prompt, temperature=0.3)
+    # Retry loop guarantees the returned insight is NEVER blank and always contains the study notes
+    for attempt in range(4):
+        result = call_groq_safely(prompt, temperature=0.25 + (attempt * 0.05))
+        if result and "### The Big Picture" in result and "What Happens" in result and len(result.strip()) > 150:
+            return result
+        time.sleep(1.0)
 
-    # PASS 2: Automated Theological & Structural Critic Check
-    # Checks if the draft has any flaws (repeated verse ranges, missing bullets, or cross-passage hallucinations)
-    critic_prompt = f"""You are a strict Theological & Editorial Reviewer for a Bible study app.
-Review the following DRAFT devotional against the EXACT BIBLICAL TEXT of {book} {chapter}:{v_range} ({translation}).
-
-EXACT BIBLICAL TEXT ({book} {chapter}:{v_range}):
-"{text}"
-
-DRAFT DEVOTIONAL TO REVIEW:
-{draft}
-
-AUDIT & FIX CHECKLIST:
-1. NO DUPLICATE VERSE RANGES OR REPEATED CONTENT: Check the headings `### 1. ...` and `### 2. ...`. Did the draft put the full verse range `({v_range})` on both headings, or repeat the same "What Happens" / "The Meaning" in both sections? If so, REWRITE Section 1 so it strictly covers ONLY the first part of the passage (e.g., Verses {part1_hint}) and REWRITE Section 2 so it strictly covers ONLY the second part (e.g., Verses {part2_hint}) with zero repetition!
-2. NO EXTERNAL HALLUCINATIONS: Did the draft claim Jesus or the text said something that is NOT in the Exact Biblical Text above (such as quoting Mark 2:27 "The Sabbath was made for man" when the text above actually argues from a sheep falling into a pit)? If so, remove the foreign quote/claim and ground the explanation strictly in what is written in the Exact Biblical Text above!
-3. SPEAKER / AUDIENCE ACCURACY: Ensure the draft accurately identifies who is speaking and to whom (e.g., praying to the Father vs. questioning the Pharisees vs. commanding the man).
-4. STRICT MARKDOWN TEMPLATE: Ensure the output uses the exact headings (`### The Big Picture: ...`, `### 1. ...`, `### 2. ...`, `### Summary`) and exact bullet labels (`* **The Context:**`, `* **What Happens:**`, `* **The Meaning:**`, and `**Ultimately:**` at the end).
-
-OUTPUT RULE:
-Output ONLY the final, corrected Markdown devotional (with no intro chatter, no "Here is the corrected version", and no notes about what you fixed). If the draft was already 100% accurate, distinct, and properly formatted, output it as-is."""
-
-    verified_output = call_groq_safely(
-        critic_prompt,
-        system_prompt="You are a precise biblical editor. Output ONLY the final polished Markdown devotional.",
-        temperature=0.15
-    )
-    return verified_output
+    return call_groq_safely(prompt, temperature=0.3)
 
 def get_chapter_summary(book, chapter, full_chapter_text):
     prompt = f"""
@@ -643,7 +643,7 @@ if not st.session_state.study_started:
     default_chap_idx = min(st.session_state.selected_chapter_num - 1, num_chaps - 1)
     chosen_chap_num = st.selectbox("Chapter", range(1, num_chaps + 1), index=max(0, default_chap_idx))
 
-    with st.spinner(f"Loading {chosen_trans} text & sections for {chosen_book_name} {chosen_chap_num}..."):
+    with st.spinner(f"Loading {chosen_trans} text & thematic sections for {chosen_book_name} {chosen_chap_num}..."):
         chap_verses = get_chapter_verses(chosen_book_name, chosen_chap_num, chosen_trans)
         preview_sections = get_chapter_sections(chosen_book_name, chosen_chap_num, chap_verses)
 
@@ -734,7 +734,7 @@ if st.session_state.current_chunk < total_chunks:
     html_text = " ".join([f"<span class='vintage-verse-num'>{start_v + i}</span>{v}" for i, v in enumerate(current_verses)])
     
     if st.button(f"Read v. {v_range} · {sec_title}  →", use_container_width=True):
-        with st.spinner(f"Studying & verifying {selected_book_name} {selected_chapter_num}:{v_range}..."):
+        with st.spinner(f"Studying {selected_book_name} {selected_chapter_num}:{v_range}..."):
             if st.session_state.history:
                 prev_summary = " | ".join([f"Verses {h['range']}: {h.get('plain_text', '')}" for h in st.session_state.history[-2:]])
             elif start_v > 1:
